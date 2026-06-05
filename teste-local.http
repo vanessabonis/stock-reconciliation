@@ -1,0 +1,472 @@
+### ============================================================
+### GUBEE STOCK RECONCILIATION — Teste Local
+### ============================================================
+###
+### PRÉ-REQUISITOS:
+### 1. docker compose up --build   (aguarde "Started Application")
+### 2. Execute os cenários NA ORDEM em que aparecem
+### 3. Cada ### separador é um request executável no IntelliJ
+###    (clique no ícone ▶ à esquerda de cada ###)
+###
+### BASE URL: http://localhost:8080
+###
+### Endpoints disponíveis:
+###   POST /events                          — ingestão de eventos
+###   GET  /stocks/{accountId}/{sku}        — saldo atual
+###   GET  /stocks/{accountId}/{sku}/history — audit trail completo
+###   GET  /events?status=PENDING|INCONSISTENT|PROCESSED|IGNORED
+###
+### Estado esperado ao final:
+###   vendedor-nike  / TENIS-NIKE-AIRMAX-41 → saldo = 10
+###   vendedor-apple / TENIS-NIKE-AIRMAX-41 → saldo = 50
+### ============================================================
+
+
+### ============================================================
+### CENÁRIO 1 — Ajuste inicial de estoque
+### ============================================================
+### O QUE ESSE CENÁRIO TESTA:
+### STOCK_ADJUSTED define o saldo de forma absoluta ("tenho N unidades").
+### Não é um delta — é a visão autoritativa do estoque físico atual.
+###
+### RESULTADO ESPERADO:
+### HTTP 200 · {"status":"PROCESSED"} · saldo = 10
+### ============================================================
+
+### >>> Verificação prévia — serviço está rodando e saudável
+
+# curl localhost:8080/actuator/health
+GET localhost:8080/actuator/health
+
+
+### Evento: vendedor-nike informa que tem 10 unidades do TENIS-NIKE-AIRMAX-41
+### Esperado: status = PROCESSED
+POST http://localhost:8080/events
+Content-Type: application/json
+
+{
+  "eventId": "evt-001",
+  "type": "STOCK_ADJUSTED",
+  "occurredAt": "2026-05-28T10:00:00Z",
+  "accountId": "vendedor-nike",
+  "sku": "TENIS-NIKE-AIRMAX-41",
+  "available": 10,
+  "reason": "inventario_inicial"
+}
+
+### >>> Verificação — campo availableQuantity deve ser 10
+### Esperado: availableQuantity = 10 (STOCK_ADJUSTED define valor absoluto)
+GET http://localhost:8080/stocks/vendedor-nike/TENIS-NIKE-AIRMAX-41
+Accept: application/json
+
+### >>> Se o resultado foi diferente, verifique: o container do banco está rodando e o Flyway aplicou as migrations
+
+
+### ============================================================
+### CENÁRIO 2 — Pedido baixa o estoque
+### ============================================================
+### O QUE ESSE CENÁRIO TESTA:
+### ORDER_CREATED debita a quantidade reservada do saldo disponível.
+###
+### RESULTADO ESPERADO:
+### HTTP 200 · {"status":"PROCESSED"} · saldo = 8 (10 - 2)
+### ============================================================
+
+### Evento: novo pedido PEDIDO-NIKE-001 reserva 2 unidades do TENIS-NIKE-AIRMAX-41
+### Esperado: status = PROCESSED
+POST http://localhost:8080/events
+Content-Type: application/json
+
+{
+  "eventId": "evt-002",
+  "type": "ORDER_CREATED",
+  "occurredAt": "2026-05-28T10:05:00Z",
+  "accountId": "vendedor-nike",
+  "sku": "TENIS-NIKE-AIRMAX-41",
+  "marketplace": "MERCADO_LIVRE",
+  "externalOrderId": "PEDIDO-NIKE-001",
+  "quantity": 2
+}
+
+### >>> Verificação — campo availableQuantity deve ser 8
+### Esperado: availableQuantity = 8 (10 - 2 reservados pelo PEDIDO-NIKE-001)
+GET http://localhost:8080/stocks/vendedor-nike/TENIS-NIKE-AIRMAX-41
+Accept: application/json
+
+### >>> Se o resultado foi diferente, verifique: o cenário 1 foi executado antes (saldo inicial = 10)
+
+
+### ============================================================
+### CENÁRIO 3 — Cancelamento devolve o estoque
+### ============================================================
+### O QUE ESSE CENÁRIO TESTA:
+### ORDER_CANCELLED para um pedido CREATED restaura o saldo debitado.
+###
+### RESULTADO ESPERADO:
+### HTTP 200 · {"status":"PROCESSED"} · saldo = 10 (8 + 2 devolvidos)
+### ============================================================
+
+### Evento: cancelamento do PEDIDO-NIKE-001 devolve as 2 unidades reservadas
+### Esperado: status = PROCESSED
+POST http://localhost:8080/events
+Content-Type: application/json
+
+{
+  "eventId": "evt-003",
+  "type": "ORDER_CANCELLED",
+  "occurredAt": "2026-05-28T10:10:00Z",
+  "accountId": "vendedor-nike",
+  "sku": "TENIS-NIKE-AIRMAX-41",
+  "marketplace": "MERCADO_LIVRE",
+  "externalOrderId": "PEDIDO-NIKE-001",
+  "quantity": 2
+}
+
+### >>> Verificação — campo availableQuantity deve ser 10 novamente
+### Esperado: availableQuantity = 10 (cancelamento devolveu as 2 unidades do PEDIDO-NIKE-001)
+GET http://localhost:8080/stocks/vendedor-nike/TENIS-NIKE-AIRMAX-41
+Accept: application/json
+
+### >>> Se o resultado foi diferente, verifique: o cenário 2 foi executado (pedido precisa existir para cancelar)
+
+
+### ============================================================
+### CENÁRIO 4 — Idempotência por eventId
+### ============================================================
+### O QUE ESSE CENÁRIO TESTA:
+### O mesmo eventId recebido duas vezes não aplica a operação duas vezes.
+### A unique constraint em processed_events.event_id é o mecanismo de proteção.
+###
+### RESULTADO ESPERADO:
+### HTTP 200 · {"status":"IGNORED"} · saldo permanece = 10 (sem alteração)
+### ============================================================
+
+### Evento: reenvio exato do evt-001 (mesmo eventId, mesmo body)
+### Esperado: status = IGNORED (constraint de unicidade detectou duplicata)
+POST http://localhost:8080/events
+Content-Type: application/json
+
+{
+  "eventId": "evt-001",
+  "type": "STOCK_ADJUSTED",
+  "occurredAt": "2026-05-28T10:00:00Z",
+  "accountId": "vendedor-nike",
+  "sku": "TENIS-NIKE-AIRMAX-41",
+  "available": 10,
+  "reason": "contagem_inicial"
+}
+
+### >>> Verificação — saldo deve permanecer 10, não resetar
+### Esperado: availableQuantity = 10 (IGNORED não altera o saldo)
+GET http://localhost:8080/stocks/vendedor-nike/TENIS-NIKE-AIRMAX-41
+Accept: application/json
+
+### >>> Se o resultado foi diferente, verifique: o eventId "evt-001" já deve constar em processed_events
+
+
+### ============================================================
+### CENÁRIO 5 — Cancelamento duplicado (duplicidade lógica)
+### ============================================================
+### O QUE ESSE CENÁRIO TESTA:
+### Dois ORDER_CANCELLED para o mesmo pedido com eventIds DIFERENTES.
+### A state machine do OrderState rejeita a segunda restauração.
+### O PEDIDO-NIKE-001 já está em estado CANCELLED desde o cenário 3.
+###
+### RESULTADO ESPERADO:
+### HTTP 422 · {"status":"INCONSISTENT"} · saldo permanece = 10 (sem dupla restauração)
+### ============================================================
+
+### Evento: segundo cancelamento do PEDIDO-NIKE-001 com eventId novo (evt-004)
+### Esperado: status = INCONSISTENT (OrderState já é CANCELLED)
+POST http://localhost:8080/events
+Content-Type: application/json
+
+{
+  "eventId": "evt-004",
+  "type": "ORDER_CANCELLED",
+  "occurredAt": "2026-05-28T10:15:00Z",
+  "accountId": "vendedor-nike",
+  "sku": "TENIS-NIKE-AIRMAX-41",
+  "marketplace": "MERCADO_LIVRE",
+  "externalOrderId": "PEDIDO-NIKE-001",
+  "quantity": 2
+}
+
+### >>> Verificação — saldo deve permanecer 10 (sem dupla devolução)
+### Esperado: availableQuantity = 10 (INCONSISTENT não altera saldo)
+GET http://localhost:8080/stocks/vendedor-nike/TENIS-NIKE-AIRMAX-41
+Accept: application/json
+
+### >>> Se o resultado foi diferente, verifique: o cenário 3 deve ter sido executado antes (PEDIDO-NIKE-001 precisa estar CANCELLED)
+
+
+### ============================================================
+### CENÁRIO 6 — Cancelamento antes do pedido (evento fora de ordem)
+### ============================================================
+### O QUE ESSE CENÁRIO TESTA:
+### ORDER_CANCELLED chegando antes do ORDER_CREATED correspondente.
+### Comportamento: o sistema segura o cancelamento em estado PENDING,
+### sem alterar o saldo. Quando ORDER_CREATED chega, resolve atomicamente:
+### debita (ORDER_CREATED) e devolve (ORDER_CANCELLED) na mesma transação.
+### Delta líquido = 0. O saldo não se altera.
+###
+### RESULTADO ESPERADO:
+### Passo 6a → HTTP 202 · {"status":"PENDING"}    · saldo = 10
+### Passo 6b → HTTP 200 · {"status":"PROCESSED"}  · saldo = 10 (net=0)
+### ============================================================
+
+### Passo 6a: cancelamento do PEDIDO-NIKE-002 que ainda não existe no sistema
+### Esperado: status = PENDING (aguardando ORDER_CREATED)
+POST http://localhost:8080/events
+Content-Type: application/json
+
+{
+  "eventId": "evt-005",
+  "type": "ORDER_CANCELLED",
+  "occurredAt": "2026-05-28T10:20:00Z",
+  "accountId": "vendedor-nike",
+  "sku": "TENIS-NIKE-AIRMAX-41",
+  "marketplace": "MERCADO_LIVRE",
+  "externalOrderId": "PEDIDO-NIKE-002",
+  "quantity": 2
+}
+
+### >>> Verificação 6a — saldo deve permanecer 10 (PENDING não debita)
+### Esperado: availableQuantity = 10 (cancelamento suspenso aguardando criação do PEDIDO-NIKE-002)
+GET http://localhost:8080/stocks/vendedor-nike/TENIS-NIKE-AIRMAX-41
+Accept: application/json
+
+### Passo 6b: criação tardia do PEDIDO-NIKE-002 (que já havia sido cancelado)
+### Esperado: status = PROCESSED — debita e devolve atomicamente (net = 0)
+POST http://localhost:8080/events
+Content-Type: application/json
+
+{
+  "eventId": "evt-006",
+  "type": "ORDER_CREATED",
+  "occurredAt": "2026-05-28T10:25:00Z",
+  "accountId": "vendedor-nike",
+  "sku": "TENIS-NIKE-AIRMAX-41",
+  "marketplace": "MERCADO_LIVRE",
+  "externalOrderId": "PEDIDO-NIKE-002",
+  "quantity": 2
+}
+
+### >>> Verificação 6b — saldo deve permanecer 10 (delta líquido = 0)
+### Esperado: availableQuantity = 10 (subtract + add-back na mesma transação)
+GET http://localhost:8080/stocks/vendedor-nike/TENIS-NIKE-AIRMAX-41
+Accept: application/json
+
+### >>> Se o resultado foi diferente, verifique: o passo 6a retornou PENDING (não PROCESSED)
+
+
+### ============================================================
+### CENÁRIO 7 — Recomposição do marketplace
+### ============================================================
+### O QUE ESSE CENÁRIO TESTA:
+### MARKETPLACE_STOCK_RESTORED e ORDER_CANCELLED para o mesmo pedido.
+### A primeira restauração vence — a segunda é INCONSISTENT.
+### Invariante: exatamente uma restauração por pedido.
+###
+### RESULTADO ESPERADO:
+### Passo 7a → HTTP 200 · {"status":"PROCESSED"}    · saldo = 7  (10 - 3)
+### Passo 7b → HTTP 200 · {"status":"PROCESSED"}    · saldo = 10 (7 + 3)
+### Passo 7c → HTTP 422 · {"status":"INCONSISTENT"} · saldo = 10 (sem dupla restauração)
+### ============================================================
+
+### Passo 7a: PEDIDO-NIKE-003 reserva 3 unidades do TENIS-NIKE-AIRMAX-41
+### Esperado: status = PROCESSED · saldo = 7
+POST http://localhost:8080/events
+Content-Type: application/json
+
+{
+  "eventId": "evt-007",
+  "type": "ORDER_CREATED",
+  "occurredAt": "2026-05-28T10:30:00Z",
+  "accountId": "vendedor-nike",
+  "sku": "TENIS-NIKE-AIRMAX-41",
+  "marketplace": "MERCADO_LIVRE",
+  "externalOrderId": "PEDIDO-NIKE-003",
+  "quantity": 3
+}
+
+### Passo 7b: marketplace restaura automaticamente as 3 unidades do PEDIDO-NIKE-003
+### Esperado: status = PROCESSED · saldo = 10 (OrderState → RESTORED)
+POST http://localhost:8080/events
+Content-Type: application/json
+
+{
+  "eventId": "evt-008",
+  "type": "MARKETPLACE_STOCK_RESTORED",
+  "occurredAt": "2026-05-28T10:35:00Z",
+  "accountId": "vendedor-nike",
+  "sku": "TENIS-NIKE-AIRMAX-41",
+  "marketplace": "MERCADO_LIVRE",
+  "externalOrderId": "PEDIDO-NIKE-003",
+  "quantity": 3
+}
+
+### Passo 7c: cancelamento tardio do mesmo PEDIDO-NIKE-003
+### Esperado: status = INCONSISTENT (já restaurado pelo marketplace — segunda restauração bloqueada)
+POST http://localhost:8080/events
+Content-Type: application/json
+
+{
+  "eventId": "evt-009",
+  "type": "ORDER_CANCELLED",
+  "occurredAt": "2026-05-28T10:40:00Z",
+  "accountId": "vendedor-nike",
+  "sku": "TENIS-NIKE-AIRMAX-41",
+  "marketplace": "MERCADO_LIVRE",
+  "externalOrderId": "PEDIDO-NIKE-003",
+  "quantity": 3
+}
+
+### >>> Verificação 7 — saldo deve ser 10 (sem dupla restauração)
+### Esperado: availableQuantity = 10 (apenas uma restauração aplicada)
+GET http://localhost:8080/stocks/vendedor-nike/TENIS-NIKE-AIRMAX-41
+Accept: application/json
+
+### >>> Se o resultado foi diferente, verifique: o passo 7b retornou PROCESSED antes do 7c
+
+
+### ============================================================
+### CENÁRIO 8 — Sincronismo enviado ao marketplace
+### ============================================================
+### O QUE ESSE CENÁRIO TESTA:
+### STOCK_SYNC_SENT é registro de auditoria apenas — não altera o saldo.
+### Conforme DECISIONS.md seção 2.3: enviar quantidade ao marketplace
+### é uma notificação, não uma retirada do inventário físico.
+###
+### RESULTADO ESPERADO:
+### HTTP 200 · {"status":"IGNORED"} · saldo permanece = 10
+### ============================================================
+
+### Evento: serviço enviou 8 unidades disponíveis do TENIS-NIKE-AIRMAX-41 ao Mercado Livre
+### Esperado: status = IGNORED (audit-only, sem impacto no saldo)
+POST http://localhost:8080/events
+Content-Type: application/json
+
+{
+  "eventId": "evt-010",
+  "type": "STOCK_SYNC_SENT",
+  "occurredAt": "2026-05-28T10:45:00Z",
+  "accountId": "vendedor-nike",
+  "sku": "TENIS-NIKE-AIRMAX-41",
+  "marketplace": "MERCADO_LIVRE",
+  "quantitySent": 8
+}
+
+### >>> Verificação — saldo deve continuar 10 (sincronismo não debita)
+### Esperado: availableQuantity = 10 (STOCK_SYNC_SENT nunca altera o saldo interno)
+GET http://localhost:8080/stocks/vendedor-nike/TENIS-NIKE-AIRMAX-41
+Accept: application/json
+
+### >>> Se o resultado foi diferente, verifique: o status retornou IGNORED (não PROCESSED)
+
+
+### ============================================================
+### CENÁRIO 9 — Isolamento multi-account
+### ============================================================
+### O QUE ESSE CENÁRIO TESTA:
+### O mesmo SKU em vendedores diferentes tem saldos independentes.
+### A chave de estoque é (accountId, sku) — não há estoque global por SKU.
+###
+### RESULTADO ESPERADO:
+### vendedor-nike  / TENIS-NIKE-AIRMAX-41 → 10 (inalterado)
+### vendedor-apple / TENIS-NIKE-AIRMAX-41 → 50 (criado agora)
+### ============================================================
+
+### Evento: vendedor-apple informa seu próprio estoque do TENIS-NIKE-AIRMAX-41
+### Esperado: status = PROCESSED · estoque do vendedor-nike não é afetado
+POST http://localhost:8080/events
+Content-Type: application/json
+
+{
+  "eventId": "evt-011",
+  "type": "STOCK_ADJUSTED",
+  "occurredAt": "2026-05-28T10:50:00Z",
+  "accountId": "vendedor-apple",
+  "sku": "TENIS-NIKE-AIRMAX-41",
+  "available": 50,
+  "reason": "estoque_vendedor_apple"
+}
+
+### >>> Verificação 9a — vendedor-nike deve permanecer com 10
+### Esperado: availableQuantity = 10 (vendedor-apple não interfere no estoque do vendedor-nike)
+GET http://localhost:8080/stocks/vendedor-nike/TENIS-NIKE-AIRMAX-41
+Accept: application/json
+
+### >>> Verificação 9b — vendedor-apple deve ter saldo 50
+### Esperado: availableQuantity = 50 (saldo independente para o vendedor-apple)
+GET http://localhost:8080/stocks/vendedor-apple/TENIS-NIKE-AIRMAX-41
+Accept: application/json
+
+### >>> Se o resultado foi diferente, verifique: a chave é (accountId, sku) — cada vendedor tem seu próprio ledger
+
+
+### ============================================================
+### CENÁRIO 10 — Consulta de histórico completo
+### ============================================================
+### O QUE ESSE CENÁRIO TESTA:
+### Rastreabilidade total: cada alteração de saldo gera uma entrada em
+### stock_history com quantityBefore, quantityAfter, delta e eventType.
+### Permite responder "por que o saldo é X?" com trilha auditável.
+###
+### RESULTADO ESPERADO:
+### Lista com as entradas dos cenários 1 a 8 em ordem cronológica.
+### Entradas esperadas (por eventType):
+###   STOCK_ADJUSTED             delta= +10  (cenário 1)
+###   ORDER_CREATED              delta= -2   (cenário 2 — PEDIDO-NIKE-001)
+###   ORDER_CANCELLED            delta= +2   (cenário 3 — PEDIDO-NIKE-001)
+###   ORDER_CREATED              delta= -2   (cenário 6 — ORDER_CREATED PEDIDO-NIKE-002)
+###   ORDER_CANCELLED            delta= +2   (cenário 6 — resolução atômica do PENDING)
+###   ORDER_CREATED              delta= -3   (cenário 7a — PEDIDO-NIKE-003)
+###   MARKETPLACE_STOCK_RESTORED delta= +3   (cenário 7b — PEDIDO-NIKE-003)
+###   STOCK_SYNC_SENT            delta=  0   (cenário 8 — audit-only)
+### ============================================================
+
+### >>> Verificação — histórico cronológico de vendedor-nike/TENIS-NIKE-AIRMAX-41
+### Esperado: lista ordenada por occurredAt com todos os eventos que alteraram o saldo
+GET http://localhost:8080/stocks/vendedor-nike/TENIS-NIKE-AIRMAX-41/history
+Accept: application/json
+
+### >>> Se o resultado foi diferente, verifique: os cenários 1 a 8 foram executados nesta sessão
+
+
+### ============================================================
+### CENÁRIO 11 — Consulta de inconsistências
+### ============================================================
+### O QUE ESSE CENÁRIO TESTA:
+### Rastreabilidade de eventos rejeitados: INCONSISTENT fica gravado em
+### processed_events com o motivo da rejeição para análise operacional.
+### Eventos esperados: evt-004 (cenário 5) e evt-009 (cenário 7c).
+###
+### RESULTADO ESPERADO:
+### Lista com 2 entradas, ambas com status = INCONSISTENT:
+###   evt-004 — ORDER_CANCELLED PEDIDO-NIKE-001 (pedido já cancelado)
+###   evt-009 — ORDER_CANCELLED PEDIDO-NIKE-003 (já restaurado pelo marketplace)
+### ============================================================
+
+### >>> Verificação — eventos com status INCONSISTENT desta sessão
+### Esperado: 2 entradas (evt-004 do cenário 5, evt-009 do cenário 7c) com motivo de rejeição
+GET http://localhost:8080/events?status=INCONSISTENT
+Accept: application/json
+
+### >>> Se o resultado foi diferente, verifique: os cenários 5 e 7c devem ter retornado HTTP 422
+
+### ============================================================
+### BÔNUS — Consulta de eventos PENDING
+### ============================================================
+### Mostra ORDER_CANCELLED aguardando seu ORDER_CREATED correspondente.
+### Deve estar vazio após o cenário 6b (o PENDING do PEDIDO-NIKE-002 foi resolvido).
+###
+### RESULTADO ESPERADO: lista vazia [] (todos os PENDING foram resolvidos)
+### ============================================================
+
+### >>> Verificação — eventos PENDING pendentes de resolução
+### Esperado: [] (evt-005 foi resolvido no cenário 6b com a chegada do PEDIDO-NIKE-002)
+GET http://localhost:8080/events?status=PENDING
+Accept: application/json
+
+### >>> Se retornou entradas, verifique: o passo 6b (ORDER_CREATED PEDIDO-NIKE-002) foi executado com sucesso

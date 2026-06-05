@@ -1,0 +1,122 @@
+spring:
+  application:
+    name: gubee-stock-reconciliation
+
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:stockdb}
+    username: ${DB_USER:stockuser}
+    password: ${DB_PASS:stockpass}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 2
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        jdbc:
+          time_zone: UTC
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092}
+    topics:
+      stock-events: ${KAFKA_TOPIC_EVENTS:stock-events}
+      stock-events-processed: ${KAFKA_TOPIC_EVENTS_PROCESSED:stock-events-processed}
+      stock-events-dlq: ${KAFKA_TOPIC_EVENTS_DLQ:stock-events-dlq}
+    admin:
+      fail-fast: false      # registra erro e continua quando o Kafka está inacessível na inicialização
+      operation-timeout: 5s  # segundos de espera para operações de tópico do AdminClient
+    producer:
+      # PRODUCER IDEMPOTENTE:
+      # enable.idempotence=true atribui um Producer ID (PID) e números de sequência a cada
+      # mensagem. O broker deduplica mensagens com mesmo PID+sequência, mesmo que o
+      # producer tente novamente após timeout de rede sem receber o ACK.
+      #
+      # Protege contra: retry do producer → broker recebe duplicata após o original
+      # ter sido confirmado mas o ACK ter sido perdido em trânsito.
+      #
+      # NÃO é o mesmo que idempotência em nível de aplicação (tratada pela constraint única em
+      # processed_events.event_id). Isso é deduplicação em nível de transporte.
+      #
+      # PRODUCER TRANSACIONAL (não utilizado — decisão documentada aqui):
+      # Transações Kafka (transactional.id + initTransactions()) garantem exactly-once
+      # em múltiplas escritas de tópico atomicamente. NÃO utilizado porque:
+      # 1. O Outbox Pattern já resolve o problema de dual-write no nível do banco,
+      #    o que é mais confiável (ACID do banco > transações Kafka).
+      # 2. Transações Kafka adicionam ~200-400ms de latência por lote (round trips do coordenador).
+      # 3. Producers transacionais exigem gerenciamento cuidadoso de instâncias — apenas um producer
+      #    por transactional.id por vez, o que complica deployments com rolling update.
+      # A combinação Outbox + producer idempotente oferece as mesmas garantias de correção
+      # com melhor desempenho e operações mais simples.
+      acks: all
+      retries: 2147483647   # Integer.MAX_VALUE — retentar indefinidamente no nível de transporte
+      properties:
+        enable.idempotence: true
+        max.in.flight.requests.per.connection: 5
+        delivery.timeout.ms: 120000
+    consumer:
+      enable-auto-commit: false   # commit manual via AckMode.BATCH
+      auto-offset-reset: earliest
+      # max-poll-records=50 limita o tamanho do lote.
+      # Se processar um lote demorar mais que max.poll.interval.ms,
+      # o Kafka considera o consumer morto e aciona um rebalanceamento.
+      # A ~10ms por evento, 50 registros = ~500ms de processamento — bem dentro de 5 min.
+      # A 10.000 eventos/seg: aumente partições, não o tamanho do lote.
+      max-poll-records: 10
+      properties:
+        max.poll.interval.ms: 600000
+        session.timeout.ms: 45000
+        heartbeat.interval.ms: 15000
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+  metrics:
+    tags:
+      application: gubee-stock-reconciliation
+      environment: ${SPRING_PROFILES_ACTIVE:local}
+  tracing:
+    sampling:
+      probability: 1.0   # 100% em desenvolvimento; reduza para 0.1 em produção
+  zipkin:
+    tracing:
+      endpoint: ${ZIPKIN_ENDPOINT:http://localhost:9411/api/v2/spans}
+
+springdoc:
+  api-docs:
+    path: /api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+
+logging:
+  level:
+    com.gubee.stockreconciliation: INFO
+
+    # Spring base (evita ruído excessivo)
+    org.springframework: WARN
+
+    # Kafka (nível correto para debug sem virar flood)
+    org.springframework.kafka: INFO
+    org.springframework.kafka.listener: INFO
+    org.springframework.kafka.container: INFO
+
+    org.apache.kafka.clients.consumer: INFO
+    org.apache.kafka.clients.producer: INFO
+    org.apache.kafka.clients.consumer.internals: WARN
+    org.apache.kafka.clients.NetworkClient: WARN
+
+    kafka: INFO

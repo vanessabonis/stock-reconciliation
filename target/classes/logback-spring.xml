@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <springProperty scope="context" name="APP_NAME" source="spring.application.name"/>
+
+    <!-- Non-local environments: structured JSON for ELK / Datadog / CloudWatch ingestion -->
+    <springProfile name="!local">
+        <appender name="JSON" class="ch.qos.logback.core.ConsoleAppender">
+            <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+                <customFields>{"service":"${APP_NAME}"}</customFields>
+                <includeMdcKeyName>eventId</includeMdcKeyName>
+                <includeMdcKeyName>eventType</includeMdcKeyName>
+                <includeMdcKeyName>accountId</includeMdcKeyName>
+                <includeMdcKeyName>sku</includeMdcKeyName>
+                <includeMdcKeyName>correlationId</includeMdcKeyName>
+                <includeMdcKeyName>traceId</includeMdcKeyName>
+                <includeMdcKeyName>spanId</includeMdcKeyName>
+                <includeMdcKeyName>kafkaPartition</includeMdcKeyName>
+                <includeMdcKeyName>kafkaOffset</includeMdcKeyName>
+                <includeMdcKeyName>status</includeMdcKeyName>
+            </encoder>
+        </appender>
+        <root level="INFO">
+            <appender-ref ref="JSON"/>
+        </root>
+    </springProfile>
+
+    <!-- Local profile: human-readable console output -->
+    <springProfile name="local">
+        <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+            <encoder>
+                <pattern>%d{HH:mm:ss} [%X{correlationId}] %-5level %logger{36} - %msg%n</pattern>
+            </encoder>
+        </appender>
+        <root level="INFO">
+            <appender-ref ref="CONSOLE"/>
+        </root>
+    </springProfile>
+
+    <!-- Default (no profile active): same as JSON -->
+    <springProfile name="default">
+        <appender name="JSON_DEFAULT" class="ch.qos.logback.core.ConsoleAppender">
+            <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+                <customFields>{"service":"${APP_NAME}"}</customFields>
+                <includeMdcKeyName>eventId</includeMdcKeyName>
+                <includeMdcKeyName>eventType</includeMdcKeyName>
+                <includeMdcKeyName>accountId</includeMdcKeyName>
+                <includeMdcKeyName>sku</includeMdcKeyName>
+                <includeMdcKeyName>correlationId</includeMdcKeyName>
+                <includeMdcKeyName>traceId</includeMdcKeyName>
+                <includeMdcKeyName>spanId</includeMdcKeyName>
+                <includeMdcKeyName>kafkaPartition</includeMdcKeyName>
+                <includeMdcKeyName>kafkaOffset</includeMdcKeyName>
+                <includeMdcKeyName>status</includeMdcKeyName>
+            </encoder>
+        </appender>
+        <root level="INFO">
+            <appender-ref ref="JSON_DEFAULT"/>
+        </root>
+    </springProfile>
+</configuration>
