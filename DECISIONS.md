@@ -112,16 +112,31 @@ Hierarquia de confiança:
 
 ## 4. Idempotência
 
-**Estratégia: unique constraint em `processed_events.event_id` + tratamento de `DataIntegrityViolationException`.**
+**Estratégia: padrão de dois passos ON CONFLICT DO NOTHING em `processed_events.event_id`.**
 
 O padrão SELECT-then-INSERT tem uma race condition TOCTOU sob requisições concorrentes: duas
 threads podem fazer SELECT, não encontrar nenhuma linha, e ambas fazerem INSERT. A abordagem
 de unique constraint é atômica no nível do banco.
 
+**Implementação (dois passos, mesma transação):**
+
+1. `guardInsert()` — `INSERT ON CONFLICT DO NOTHING` no **início** da transação:
+   - Retorna 1 se o slot foi recém-inserido (primeira entrega) → segue com lógica de negócio.
+   - Retorna 0 se o `event_id` já existia (entrega duplicada) → `process()` retorna `IGNORED` imediatamente.
+   - Status inicial da linha: `PROCESSING` (valor transiente do enum `EventStatus`).
+   - Nenhuma exceção é lançada na duplicata — o PostgreSQL trata silenciosamente via `DO NOTHING`.
+
+2. `finalizeStatus()` — `UPDATE ... SET status = ?` no **final** da transação:
+   - Substitui `PROCESSING` pelo resultado final de negócio: `PROCESSED`, `IGNORED`, `PENDING` ou `INCONSISTENT`.
+   - Garante que `PROCESSING` nunca apareça em dados finais persistidos.
+
+Esta abordagem elimina o ruído de `SqlExceptionHelper ERROR` que o tratamento de
+`DataIntegrityViolationException` produzia para duplicatas esperadas (o erro 23505 do PostgreSQL
+era registrado pelo Hibernate mesmo sendo comportamento correto de negócio).
+
 Ao receber um `eventId` duplicado:
-- O INSERT em `processed_events` falha com violação de unique constraint.
-- A aplicação captura `DataIntegrityViolationException`, faz rollback e retorna
-  `EventStatus.IGNORED` — sem query secundária ao banco, sem lógica de negócio executada duas vezes.
+- `guardInsert()` retorna 0 sem exceção.
+- `process()` retorna `EventStatus.IGNORED` imediatamente — sem lógica de negócio executada.
 - A resposta HTTP é 200 OK com status=IGNORED.
 
 ---
@@ -196,6 +211,7 @@ Transições inválidas → evento `INCONSISTENT`, sem alteração de estoque:
 | `IGNORED`      | Evento recebido, mas sem ação tomada (`STOCK_SYNC_SENT` ou `eventId` duplicado)  |
 | `PENDING`      | Evento recebido, aguardando um evento pré-requisito                              |
 | `INCONSISTENT` | Evento conflita com o estado atual; registrado mas não aplicado                  |
+| `PROCESSING`   | Estado transiente: linha reservada via `guardInsert`, resultado final ainda não escrito. Nunca deve persistir após commit; visível no banco apenas dentro da janela transacional |
 
 ---
 
@@ -244,27 +260,17 @@ Versionamento de schema é explícito e reproduzível. Sem `spring.jpa.hibernate
 | `STOCK_ADJUSTED` absoluto | Último a escrever vence | Correto para recontagens manuais; pode perder um ajuste concorrente |
 | Retry em processo | Exponential backoff simples | Sob contenção muito alta, 409s são possíveis; Kafka+outbox elimina isso |
 | REST síncrono | Simples, amigável para demo | Em produção: event streaming (Kafka) é melhor para throughput |
-| Eventos `PENDING` como linhas no banco | Consultável, auditável | Exige um job em background para detectar eventos `PENDING` obsoletos (não implementado) |
+| Eventos `PENDING` como linhas no banco | Consultável, auditável | `PendingReconciliationJob` detecta obsoletos: WARN após 10 min, DLQ após 30 min |
 | Sem modelo de leitura CQRS | Banco único para leituras e escritas | Sob carga pesada de leitura, uma read replica dedicada ou cache seria necessário |
 
 ---
 
 ## 11. O Que Faria Diferente em Produção
 
-1. **Consumers Kafka** em vez de ingestão por REST — entrega at-least-once com offsets de
-   consumer group; a unique constraint em `event_id` continua garantindo idempotência.
-2. **Transactional Outbox** — em vez de escritas diretas no banco por evento, escrever eventos
-   em uma tabela de outbox e publicar para sistemas downstream de forma atômica.
-3. **Modelo de leitura CQRS** — uma projeção separada e desnormalizada para consultas de estoque,
+1. **Modelo de leitura CQRS** — uma projeção separada e desnormalizada para consultas de estoque,
    atualizada assincronamente; elimina contenção entre leituras e escritas.
-4. **Job de reconciliação de `PENDING`** — identificar periodicamente eventos `PENDING` mais
-   antigos que N minutos e alertar ou tentar reentrega do pré-requisito ausente.
-5. **Distributed tracing** (OpenTelemetry) — substituir correlation IDs via MDC por W3C trace
-   context para visibilidade entre serviços.
-6. **Schema registry** para schemas de eventos — garante compatibilidade retroativa entre
+2. **Schema registry** para schemas de eventos — garante compatibilidade retroativa entre
    produtores.
-7. **Dead letter queue** para eventos que falham após todos os retries — evita perda silenciosa
-   de dados.
 
 ---
 
@@ -293,13 +299,22 @@ atomicamente dentro de uma única transação: subtrai (`ORDER_CREATED`) e depoi
 (`ORDER_CANCELLED`), net=0. Isso preserva a corretude, produz um audit trail limpo e evita
 qualquer janela onde o estoque está incorreto.
 
-### 12.4 Unique constraint para idempotência (não SELECT+INSERT)
+### 12.4 ON CONFLICT DO NOTHING para idempotência (não SELECT+INSERT nem captura de exceção)
 
 SELECT-then-INSERT tem uma race condition TOCTOU: sob requisições concorrentes, duas threads
-podem ambas ler "não encontrado" e ambas inserir. Uma unique constraint no nível do banco é
-atômica — exatamente um insert vence, o outro recebe violação de constraint. A camada de
-aplicação captura `DataIntegrityViolationException` e retorna `IGNORED`, tornando a operação
-segura sob qualquer nível de concorrência.
+podem ambas ler "não encontrado" e ambas inserir. A unique constraint no nível do banco é
+atômica — exatamente um INSERT vence. O segundo usa `ON CONFLICT DO NOTHING` e retorna 0
+(linhas afetadas) em vez de lançar exceção.
+
+O padrão anterior (capturar `DataIntegrityViolationException`) era correto em termos de
+comportamento, mas produzia ruído de ERROR no log do Hibernate para toda duplicata esperada
+(erro 23505), poluindo dashboards e alertas. O padrão atual (`ON CONFLICT DO NOTHING` +
+verificação do retorno inteiro) é semanticamente idêntico, mas completamente silencioso para
+duplicatas: nenhuma exceção, nenhum rollback, nenhuma linha de log ERROR.
+
+O estado transiente `EventStatus.PROCESSING` serve como sentinela entre os dois passos
+(guardInsert e finalizeStatus), visível no banco apenas durante a janela transacional.
+Se uma transação for revertida, a linha desaparece — sem estado órfão.
 
 ### 12.5 Optimistic locking + retry vs pessimistic locking
 
@@ -335,12 +350,13 @@ commita, a linha do outbox existe e o relay PUBLICARÁ eventualmente. Se a trans
 a linha do outbox não existe e nada é publicado. Garantia at-least-once sem janela de
 inconsistência.
 
-### at-least-once delivery + unique constraint = efeito exactly-once
+### at-least-once delivery + ON CONFLICT DO NOTHING = efeito exactly-once
 
 Kafka garante at-least-once: uma mensagem pode ser entregue mais de uma vez (rebalanceamento,
-consumer crash antes de commitar o offset). A unique constraint em `processed_events.event_id`
+consumer crash antes de commitar o offset). O `guardInsert()` com `ON CONFLICT (event_id) DO NOTHING`
 garante que o efeito de negócio acontece exatamente uma vez mesmo que a mensagem seja entregue
-duas vezes. O segundo processamento recebe `DataIntegrityViolationException` e retorna `IGNORED`.
+duas vezes. O segundo processamento tem `guardInsert()` retornando 0 e `process()` retornando
+`IGNORED` imediatamente — sem exceção, sem rollback, sem ruído no log.
 A combinação elimina a necessidade de exactly-once ao nível do Kafka (que tem overhead significativo
 de ~200–400ms por batch com transactional producers).
 
@@ -351,6 +367,26 @@ Sob múltiplas instâncias deployadas, cada relay concorreria pelas mesmas linha
 potencial ou serialização total). `SKIP LOCKED` faz cada instância pular linhas já bloqueadas
 e pegar apenas linhas disponíveis — sem espera, sem duplicata, processamento paralelo eficiente.
 Resultado: cada linha do outbox é processada por exatamente uma instância do relay.
+
+### `NonRetryableMessageException` — distinção entre falhas retryable e não-retryable
+
+Falhas de processamento Kafka se dividem em dois grupos com semânticas opostas:
+
+- **Não-retryable** (`NonRetryableMessageException`): JSON malformado, `EventType` desconhecido,
+  valor de campo inválido. Os bytes na wire nunca vão mudar — retry só atrasa a partição e
+  bloqueia eventos válidos que vêm depois. Ação: ir diretamente ao DLQ sem nenhum backoff.
+
+- **Retryable** (`RuntimeException`): falha transiente de DB, colisão de lock otimista, timeout
+  de rede. O estado pode mudar entre tentativas. Ação: backoff exponencial
+  (500ms → 1000ms → 2000ms), depois DLQ após 3 tentativas.
+
+O `DefaultErrorHandler` registra `NonRetryableMessageException` em `addNotRetryableExceptions()`.
+O log `kafka.message.routed_to_dlq` e a métrica `gubee.dlq.events` são emitidos exclusivamente
+pelo recoverer — uma única ocorrência por mensagem, independente do número de tentativas.
+
+Alternativa rejeitada: capturar o tipo de exceção no consumer e retornar sem relançar.
+Problema: o offset seria commitado silenciosamente e o evento nunca chegaria ao DLQ —
+perda de dados sem nenhum sinal operacional.
 
 ### Por que não SQS ou GCP Pub/Sub?
 
@@ -413,10 +449,26 @@ Todos os logs são emitidos como JSON via `logstash-logback-encoder` em ambiente
 Isso permite reconstruir a linha do tempo completa de processamento de qualquer evento com um
 único `grep` pelo `correlationId`, sem necessidade de infraestrutura de distributed tracing.
 
+### Jaeger em vez de Zipkin
+
+A stack de tracing migrou de Zipkin para Jaeger com receiver OTLP HTTP (porta 4318).
+Motivação: o protocolo OTLP é o padrão OpenTelemetry nativo — Zipkin usa um protocolo legado
+(`/api/v2/spans`) que exige uma bridge adicional. Com OTLP direto, o `micrometer-tracing-bridge-otel`
+envia spans sem adaptação, e a stack de produção pode trocar Jaeger por qualquer backend OTLP
+(Grafana Tempo, AWS X-Ray via ADOT collector) sem alterar código de aplicação.
+
+### Propagação automática do W3C traceparent no Kafka
+
+`spring.kafka.template.observation-enabled: true` e `ContainerProperties.setObservationEnabled(true)`
+habilitam a injeção e extração automática do header W3C `traceparent` em cada mensagem Kafka.
+O OutboxRelay injeta o header ao publicar; o consumer extrai e cria um span filho.
+Resultado: um único trace cobre DB write → outbox relay → Kafka publish → consumer processing,
+com visibilidade ponta a ponta através da fronteira assíncrona no Jaeger.
+
 ### Correlation IDs vs distributed tracing
-MDC correlation IDs são suficientes para um serviço único. Em produção com múltiplos serviços,
-substituir pelo W3C trace context do OpenTelemetry — o `correlationId` passa a ser o trace ID
-propagado via headers HTTP e headers de mensagens Kafka entre serviços.
+MDC correlation IDs cobrem rastreamento intra-serviço. O W3C `traceparent` (agora propagado
+via headers Kafka e HTTP) cobre rastreamento entre serviços — ambos coexistem: o `traceId` do
+OTel torna-se o `correlationId` no MDC pela bridge automática do Micrometer.
 
 ### Filosofia de design das métricas
 Cada métrica responde a uma pergunta operacional específica:
@@ -426,9 +478,14 @@ Cada métrica responde a uma pergunta operacional específica:
 - `gubee.dlq.events` → estamos perdendo mensagens? (deve ser sempre zero)
 - `gubee.optimistic.lock.retries` → há contenção de escrita em algum SKU?
 - `gubee.insufficient.stock` → vendedores estão fazendo overselling?
+- `gubee.reconciliation.pending_backlog` → quantos `ORDER_CANCELLED` aguardam `ORDER_CREATED` acima do threshold?
+- `gubee.reconciliation.actions{action="warn|dlq"}` → backlog drenando normalmente ou escalando para DLQ?
+- `gubee.reconciliation.pending_age` (histograma) → p95 crescente = eventos acumulando sem resolução
+- `gubee.events.pending.orderstate` → gauge de `ORDER_CANCELLED` em estado PENDING (atualizado a cada scrape via query ao banco)
 
 O counter DLQ é um alerta crítico em qualquer valor acima de zero.
 O gauge de pending do outbox é o sinal primário de backpressure.
+O gauge `reconciliation.pending_backlog` usa `AtomicLong` atualizado pelo job — o Prometheus lê memória, não faz query ao banco a cada scrape (evitando N queries adicionais a 15s de intervalo).
 
 ### Por que Prometheus em vez de métricas push
 O Prometheus faz scrape de `/actuator/prometheus` no próprio ciclo. O serviço não tem
@@ -451,9 +508,60 @@ tem uma janela onde dados podem ser perdidos silenciosamente.
 
 ---
 
-## 15. Análise de Volume e Comportamento de Escala
+## 15. Decisões do Job de Reconciliação de PENDING
 
-### 15.1 Para o MESMO SKU
+### Estratégia de dois níveis (warn → DLQ) em vez de ação única
+
+Um evento `PENDING` pode estar aguardando legitimamente (`ORDER_CREATED` ainda em trânsito,
+atraso de rede) ou pode ser um órfão real (o `ORDER_CREATED` foi perdido ou nunca será entregue).
+Tratar ambos os casos com a mesma ação seria incorreto:
+
+- **Nível 1 — warn threshold (10 min, padrão):** provável atraso legítimo. Ação: WARN log +
+  incremento de métrica. Operadores são notificados mas sem ação automática irreversível.
+- **Nível 2 — DLQ threshold (30 min, padrão):** evento provavelmente órfão. Ação: publicação
+  no tópico DLQ + ERROR log + métrica de DLQ. O time de plantão recebe alerta via
+  `gubee.dlq.events` e investiga manualmente. O evento no DLQ serve como trigger para
+  reentrega manual ou investigação do producer ausente.
+
+Ambos os thresholds são configuráveis via variáveis de ambiente
+(`RECONCILIATION_PENDING_THRESHOLD_MINUTES`, `RECONCILIATION_DLQ_THRESHOLD_MINUTES`)
+para ajuste sem redeploy.
+
+### Idempotência do job — read-only no banco
+
+O job não altera nenhuma linha do banco — é estritamente read-only.
+A única side-effect é a publicação no DLQ. Execuções duplicadas (overlap de instâncias, restart)
+produzem no máximo mensagens DLQ duplicadas para o mesmo `eventId`, o que é aceitável: o
+operador filtra por `eventId` e investiga uma única ocorrência.
+
+Alternativa rejeitada: marcar o evento como `INCONSISTENT` no banco ao escalar para DLQ.
+Problema: isso alteraria o estado do evento antes da investigação — um operador perderia a
+capacidade de ver que o evento estava `PENDING` quando foi escalado. O DLQ carrega o contexto
+completo no payload; a tabela `processed_events` permanece auditável com o estado original.
+
+### Índice composto `(status, processed_at)` — por que não usar apenas o índice de `status`
+
+O índice existente em `status` cobre filtros `WHERE status = 'PENDING'` mas não o filtro de
+data `AND processed_at < threshold`. Sem o índice composto, a query do job faz full scan de
+todas as linhas `PENDING` para depois filtrar por data — escalando linearmente com o volume.
+
+Com o índice composto `idx_processed_events_status_processed_at`, o PostgreSQL satisfaz o
+predicado completo via index range scan. Um job executando a cada 5 minutos em produção
+(300.000ms `check-interval-ms`) não deveria afetar o throughput de escrita da tabela —
+mas sem o índice, sob volume alto, esse job seria um problema de performance não óbvio.
+
+### Por que `fixedDelay` em vez de `@Scheduled(cron = ...)`
+
+`fixedDelayString` conta o intervalo a partir do FIM da execução anterior. Com `cron`, se uma
+execução levar mais do que o intervalo do cron, a próxima dispara imediatamente — podendo
+causar overlap sob lentidão do banco. `fixedDelay` garante um mínimo de N ms entre execuções,
+evitando overlap por design.
+
+---
+
+## 16. Análise de Volume e Comportamento de Escala
+
+### 16.1 Para o MESMO SKU
 
 **100 eventos/seg:**
 - Estratégia de partition: todos os eventos de um SKU são roteados para a mesma partition Kafka
@@ -491,7 +599,7 @@ tem uma janela onde dados podem ser perdidos silenciosamente.
   (soft-lock) em vez de atualizações de estoque em tempo real.
 - **Veredicto:** arquitetura atual atinge seu limite. Limitação honesta documentada aqui.
 
-### 15.2 Para SKUs DIFERENTES
+### 16.2 Para SKUs DIFERENTES
 
 **100 eventos/seg (entre N SKUs):**
 - 3 partitions × 3 instâncias de consumer = ~33 eventos/seg por partition em média.
@@ -522,7 +630,7 @@ tem uma janela onde dados podem ser perdidos silenciosamente.
 - **Veredicto:** horizontalmente escalável com mudanças de configuração, sem alterações de código.
   `SKIP LOCKED` no outbox é o habilitador-chave para relay multi-instância.
 
-### 15.3 A sequência de gargalos (em ordem de aparecimento)
+### 16.3 A sequência de gargalos (em ordem de aparecimento)
 
 | # | Gargalo | Aparece em |
 |---|---------|------------|
@@ -532,7 +640,7 @@ tem uma janela onde dados podem ser perdidos silenciosamente.
 | 4 | Teto de throughput de escrita do PostgreSQL | ~10.000–15.000 escritas/seg por instância |
 | 5 | Contagem de partitions Kafka (fixada na criação do tópico) | planejar com antecedência — não pode ser reduzida |
 
-### 15.4 Estratégia de evolução de schema
+### 16.4 Estratégia de evolução de schema
 
 Implementação atual: JSON sem validação de schema.
 Risco: um produtor pode adicionar/remover campos sem aviso, quebrando consumers silenciosamente.
@@ -551,7 +659,7 @@ Estratégia para produção:
 Documentado como: implementado = JSON sem registry (aceitável para demo),
 produção = Schema Registry com Avro, caminho de migração = campo `version` no payload.
 
-### 15.5 Por que batch processing não foi implementado
+### 16.5 Por que batch processing não foi implementado
 
 Para o mesmo SKU acima de 1.000 eventos/segundo, a otimização natural seria agrupar eventos
 dentro de um batch do poll e computar o efeito líquido com um único UPDATE na tabela `stocks`.

@@ -1,4 +1,3 @@
-version: "3.9"
 
 services:
   postgres:
@@ -55,6 +54,8 @@ services:
         condition: service_healthy
       kafka:
         condition: service_healthy
+      jaeger:
+        condition: service_started
     environment:
       DB_HOST: postgres
       DB_PORT: 5432
@@ -62,18 +63,29 @@ services:
       DB_USER: stockuser
       DB_PASS: stockpass
       KAFKA_BOOTSTRAP: kafka:29092
+      OTLP_ENDPOINT: http://jaeger:4318/v1/traces
     ports:
       - "8080:8080"
 
-  # Zipkin UI: http://localhost:9411
-  # Search by traceId to follow an event from Kafka ingestion through
-  # DB write, outbox relay, and published confirmation.
-  # In production: replace with Jaeger or OpenTelemetry Collector.
-  zipkin:
-    image: openzipkin/zipkin:3
-    container_name: zipkin
+  # Jaeger UI: http://localhost:16686
+  # Aceita spans via OTLP HTTP (porta 4318) — compatível com micrometer-tracing-bridge-otel.
+  # Busque por traceId para seguir um evento do consumer Kafka → escrita no banco
+  # → relay do outbox → publicação confirmada.
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    container_name: jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
     ports:
-      - "9411:9411"
+      - "16686:16686"   # Jaeger UI
+      - "4318:4318"     # OTLP HTTP receiver
+
+  k6:
+    image: grafana/k6
+    network_mode: host
+    volumes:
+      - ./stress-test:/scripts
+    entrypoint: [ "k6", "run", "/scripts/k6-stress.js" ]
 
 volumes:
   pgdata:

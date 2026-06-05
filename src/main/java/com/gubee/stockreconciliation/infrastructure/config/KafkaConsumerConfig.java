@@ -1,6 +1,10 @@
 package com.gubee.stockreconciliation.infrastructure.config;
 
+import com.gubee.stockreconciliation.adapter.in.kafka.NonRetryableMessageException;
+import com.gubee.stockreconciliation.infrastructure.metrics.StockMetrics;
 import org.apache.kafka.common.TopicPartition;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -15,24 +19,44 @@ import org.springframework.kafka.support.ExponentialBackOffWithMaxRetries;
 @Configuration
 public class KafkaConsumerConfig {
 
+    private static final Logger log = LoggerFactory.getLogger(KafkaConsumerConfig.class);
+
     @Value("${spring.kafka.topics.stock-events-dlq}")
     private String dlqTopic;
 
     /**
-     * Error handler com backoff exponencial e roteamento para DLQ.
-     * Após 3 tentativas falhas (500ms → 1000ms → 2000ms), a mensagem é
-     * enviada para stock-events-dlq para inspeção manual.
-     * Alerte para qualquer mensagem na DLQ — elas representam eventos que não puderam ser
-     * processados após todas as tentativas (incompatibilidade de schema, erro persistente no banco, etc.).
+     * Error handler com backoff exponencial, roteamento para DLQ, e métricas.
+     *
+     * Retryable (RuntimeException): backoff 500ms → 1000ms → 2000ms, depois DLQ.
+     * Non-retryable (NonRetryableMessageException): sem backoff — vai direto ao DLQ.
+     * Payload malformado nunca vai melhorar com retry; o backoff só atrasa a partição.
+     *
+     * O recoverer é o único ponto onde kafka.message.routed_to_dlq é logado e
+     * a métrica gubee.dlq.events é incrementada — garantindo exatamente uma ocorrência
+     * por mensagem, independente de quantas tentativas foram feitas antes.
      */
     @Bean
-    public DefaultErrorHandler errorHandler(KafkaTemplate<String, String> template) {
+    public DefaultErrorHandler errorHandler(KafkaTemplate<String, String> template,
+                                             StockMetrics stockMetrics) {
         DeadLetterPublishingRecoverer recoverer = new DeadLetterPublishingRecoverer(template,
-                (r, e) -> new TopicPartition(dlqTopic, 0));
+                (record, exception) -> {
+                    String reason = exception instanceof NonRetryableMessageException
+                            ? "parse_error" : "processing_error";
+                    stockMetrics.recordDlqEvent("UNKNOWN", reason);
+                    log.error("kafka.message.routed_to_dlq topic={} partition={} offset={} reason={}",
+                            record.topic(), record.partition(), record.offset(), reason);
+                    return new TopicPartition(dlqTopic, 0);
+                });
+
         ExponentialBackOffWithMaxRetries backoff = new ExponentialBackOffWithMaxRetries(3);
         backoff.setInitialInterval(500);
         backoff.setMultiplier(2.0);
-        return new DefaultErrorHandler(recoverer, backoff);
+
+        DefaultErrorHandler errorHandler = new DefaultErrorHandler(recoverer, backoff);
+        // NonRetryableMessageException bypasses the retry backoff entirely — goes straight to DLQ.
+        // This covers malformed JSON, unknown EventType enum values, and invalid field values.
+        errorHandler.addNotRetryableExceptions(NonRetryableMessageException.class);
+        return errorHandler;
     }
 
     /**
@@ -61,6 +85,10 @@ public class KafkaConsumerConfig {
         // Como este consumer apenas grava no banco (sem publicação downstream), BATCH é
         // suficiente e mais simples. O OutboxRelay cuida da publicação separadamente.
         factory.getContainerProperties().setAckMode(ContainerProperties.AckMode.BATCH);
+        // Habilita propagação automática do header W3C traceparent nos consumers Kafka.
+        // O Spring Kafka extrai o header de cada mensagem e cria um span filho no trace OTel,
+        // conectando visualmente o processamento do consumer ao producer que publicou o evento.
+        factory.getContainerProperties().setObservationEnabled(true);
         return factory;
     }
 }

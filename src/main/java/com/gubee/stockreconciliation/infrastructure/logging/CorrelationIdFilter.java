@@ -12,27 +12,45 @@ import java.io.IOException;
 import java.util.UUID;
 
 /**
- * Atribui um traceId a cada requisição recebida e o adiciona ao MDC,
- * permitindo que todos os logs gerados durante o processamento da mesma
- * requisição utilizem o mesmo correlationId.
+ * Mantém dois identificadores em paralelo durante a migração Brave → OTel:
+ *
+ *   correlationId — chave humana simples para logs e dashboards legados.
+ *                   Fonte: X-Trace-Id (header legado) ou UUID gerado.
+ *                   Permanece no MDC para sistemas que ainda não consomem traceparent.
+ *
+ *   traceId/spanId — populados automaticamente pelo Micrometer Tracing OTel bridge.
+ *                    São a source of truth para distributed tracing (Jaeger/Tempo).
+ *
+ * O header W3C traceparent é propagado na resposta para que clientes novos possam
+ * usar o trace context OTel. O X-Trace-Id é mantido na resposta para compatibilidade
+ * com clientes legados que ainda correlacionam por esse header.
  */
 @Component
 public class CorrelationIdFilter extends OncePerRequestFilter {
 
-    private static final String TRACE_ID_HEADER = "X-Trace-Id";
+    private static final String TRACEPARENT_HEADER = "traceparent";
+    private static final String LEGACY_TRACE_HEADER = "X-Trace-Id";
 
     @Override
     protected void doFilterInternal(HttpServletRequest request,
-                                     HttpServletResponse response,
-                                     FilterChain chain) throws ServletException, IOException {
-        String traceId = request.getHeader(TRACE_ID_HEADER);
-        if (traceId == null || traceId.isBlank()) {
-            traceId = UUID.randomUUID().toString();
+                                    HttpServletResponse response,
+                                    FilterChain chain) throws ServletException, IOException {
+        // correlationId: chave humana simples — fonte preferida é o header legado para
+        // manter compatibilidade; cai no UUID se nenhum header estiver presente.
+        String legacyTraceId = request.getHeader(LEGACY_TRACE_HEADER);
+        String correlationId = (legacyTraceId != null && !legacyTraceId.isBlank())
+                ? legacyTraceId
+                : UUID.randomUUID().toString();
+
+        MDC.put("correlationId", correlationId);
+
+        // Propaga ambos os headers na resposta para suportar clientes legados e OTel
+        response.setHeader(LEGACY_TRACE_HEADER, correlationId);
+        String traceparent = request.getHeader(TRACEPARENT_HEADER);
+        if (traceparent != null && !traceparent.isBlank()) {
+            response.setHeader(TRACEPARENT_HEADER, traceparent);
         }
-        // correlationId = X-Trace-Id fornecido pelo chamador para correlação entre serviços.
-        // traceId + spanId são definidos automaticamente pela bridge do Micrometer Tracing (Brave).
-        MDC.put("correlationId", traceId);
-        response.setHeader(TRACE_ID_HEADER, traceId);
+
         try {
             chain.doFilter(request, response);
         } finally {

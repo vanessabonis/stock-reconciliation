@@ -4,10 +4,17 @@ import com.gubee.stockreconciliation.adapter.out.postgres.mapper.ProcessedEventP
 import com.gubee.stockreconciliation.adapter.out.postgres.repository.ProcessedEventJpaRepository;
 import com.gubee.stockreconciliation.domain.model.ProcessedEvent;
 import com.gubee.stockreconciliation.domain.model.enums.EventStatus;
+import com.gubee.stockreconciliation.domain.model.enums.EventType;
+import com.gubee.stockreconciliation.domain.model.vo.AccountId;
 import com.gubee.stockreconciliation.domain.model.vo.EventId;
+import com.gubee.stockreconciliation.domain.model.vo.Sku;
 import com.gubee.stockreconciliation.domain.port.out.ProcessedEventRepository;
 import org.springframework.stereotype.Component;
 
+// EventStatus.PROCESSING is imported here to enforce that the initial-status string
+// always tracks the enum value — changing the enum constant automatically propagates here.
+
+import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 
@@ -48,5 +55,20 @@ public class ProcessedEventRepositoryAdapter implements ProcessedEventRepository
     @Override
     public long countByStatus(EventStatus status) {
         return jpaRepository.countByStatus(status.name());
+    }
+
+    @Override
+    public boolean tryInsert(EventId eventId, EventType type, AccountId accountId, Sku sku, Instant occurredAt) {
+        // Passes EventStatus.PROCESSING.name() explicitly so that the enum is the single
+        // source of truth for this transient sentinel value. Any rename of the enum constant
+        // will surface as a compile error here rather than a runtime mismatch.
+        return jpaRepository.guardInsert(
+                eventId.value(), type.name(), EventStatus.PROCESSING.name(),
+                accountId.value(), sku.value(), occurredAt) > 0;
+    }
+
+    @Override
+    public void finalizeStatus(EventId eventId, EventStatus status, String details) {
+        jpaRepository.finalizeStatus(eventId.value(), status.name(), details);
     }
 }

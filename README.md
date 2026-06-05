@@ -24,8 +24,9 @@ See [DECISIONS.md](DECISIONS.md) for technical decisions, assumptions, and trade
 | Tests | JUnit 5 + Testcontainers |
 | Logging | Logback + Logstash JSON encoder (structured, with MDC correlation) |
 | Metrics | Micrometer + Prometheus (`/actuator/prometheus`) |
-| Tracing | Micrometer Tracing (Brave bridge) + Zipkin |
+| Tracing | Micrometer Tracing (OTel bridge) + Jaeger (OTLP HTTP) |
 | Messaging | Spring Kafka (producer reliability config) |
+| Load testing | k6 (Docker, no local install required) |
 | Containers | Docker Compose |
 
 ## Running Locally
@@ -81,7 +82,7 @@ Both paths are functionally equivalent. The REST endpoint exists so you can exer
 | `GET` | `/stocks/{accountId}/{sku}/history` | Full audit history |
 | `GET` | `/events?status=PENDING` | Query events by status |
 
-Event statuses in response: `PROCESSED`, `IGNORED` (200), `PENDING` (202), `INCONSISTENT` (422).
+Event statuses in response: `PROCESSED`, `IGNORED` (200 OK), `PENDING` (202 Accepted), `INCONSISTENT` (422 Unprocessable Entity).
 
 ## Event Examples (curl)
 
@@ -148,7 +149,7 @@ Expected: `{"status":"PROCESSED"}` — stock returns to 10.
 
 ### Scenario 4 — Duplicate eventId (idempotency)
 
-Send the exact same `evt-002` again. Expected: `{"status":"PROCESSED"}`, stock unchanged at 8.
+Send the exact same `evt-002` again. Expected: `{"status":"IGNORED"}`, stock unchanged at 8.
 
 ### Scenario 5 — Duplicate cancellation (logical duplicate)
 
@@ -246,21 +247,29 @@ curl -s "http://localhost:8080/events?status=INCONSISTENT" | jq
 | `gubee_events_processed_total` | Counter | Events by type + status | — |
 | `gubee_events_failed_total` | Counter | Failures by eventType + reason | > 0 per minute |
 | `gubee_events_pending_orderstate` | Gauge | ORDER_CANCELLED awaiting ORDER_CREATED | > 100 |
-| `gubee_event_processing_duration_seconds` | Timer | Processing latency per event | p95 > 500ms |
+| `gubee_event_processing_duration_seconds` | Timer | Processing latency per event type | p95 > 500ms |
 | `gubee_outbox_pending` | Gauge | Outbox entries awaiting relay | > 500 |
 | `gubee_outbox_publish_latency_seconds` | Timer | Relay publish latency | p95 > 5s |
-| `gubee_dlq_events_total` | Counter | Events routed to DLQ | > 0 (page immediately) |
+| `gubee_outbox_purged_total` | Counter | PUBLISHED outbox rows deleted by purge job | — |
+| `gubee_dlq_events_total` | Counter | Events routed to DLQ (parse error or retries exhausted) | > 0 (page immediately) |
 | `gubee_optimistic_lock_retries_total` | Counter | Optimistic lock collision retries | > 10/min sustained |
+| `gubee_reconciliation_pending_backlog` | Gauge | PENDING events stale beyond warn threshold (10 min) | > 0 for > 2 windows |
+| `gubee_reconciliation_actions_total` | Counter | Reconciliation job actions by type (warn / dlq) | dlq > 0 (page) |
+| `gubee_reconciliation_pending_age_seconds` | Timer/Histogram | Age of stale PENDING events at detection | p95 rising = events accumulating |
 | `kafka_consumer_records_lag` | Gauge | Consumer lag per partition | > 1000 for > 2min |
 
 ### Distributed Tracing
-`http://localhost:9411` — Zipkin UI (start with `docker compose up zipkin`)
+`http://localhost:16686` — Jaeger UI (starts automatically with `docker compose up`)
 
 Every event generates a trace spanning:
 - HTTP/Kafka ingestion → DB write → outbox creation → relay publish
 
-Search by `traceId` (present in every log line) to reconstruct the full processing timeline
-of any event across async boundaries.
+The service sends spans via OTLP HTTP to Jaeger. The W3C `traceparent` header is
+automatically propagated in Kafka messages, so the consumer's span is linked to the
+producer's span — the full async chain is visible as a single trace in Jaeger.
+
+Search by `traceId` (present in every structured log line) to reconstruct the complete
+processing timeline of any event across async boundaries.
 
 ### Structured Logs
 JSON format. Every log line includes:
@@ -269,13 +278,39 @@ JSON format. Every log line includes:
 ### Health
 `GET /actuator/health`
 
+## Stress Testing
+
+Four k6 scenarios cover the main operational concerns. No local k6 installation needed — runs entirely via Docker:
+
+| Scenario | What it validates | Key invariant |
+|----------|------------------|---------------|
+| A — Concurrent same SKU | Optimistic locking under contention | `availableQuantity >= 0` always |
+| B — Different SKUs | Pure throughput with no lock contention | p95 < 300ms, error rate < 1% |
+| C — Idempotency flood | `ON CONFLICT DO NOTHING` under 20 concurrent duplicates | Only `PROCESSED` or `IGNORED` — never 5xx |
+| D — Realistic load | Ramp to 1,000 events/sec with a realistic event mix | Reveals the actual production bottleneck sequence |
+
+```bash
+# Run all scenarios
+docker run --rm -i --network host \
+  -e BASE_URL=http://localhost:8080 \
+  grafana/k6 run - < stress-test/k6-stress.js
+
+# Run a single scenario
+docker run --rm -i --network host \
+  -e BASE_URL=http://localhost:8080 \
+  grafana/k6 run - < stress-test/k6-stress.js \
+  --env SCENARIO=concurrent_same_sku
+```
+
+See [stress-test/STRESS_GUIDE.md](stress-test/STRESS_GUIDE.md) for the full guide: smoke test, per-bottleneck diagnosis, and how to interpret k6 output.
+
 ## Known Limitations
 
 - **STOCK_SYNC_SENT with no prior stock**: The event is recorded as IGNORED but no StockHistory
   entry is created (no stock record exists to attach it to). This is safe and expected.
-- **PENDING events are never auto-retried**: If ORDER_CREATED never arrives for a pending
-  ORDER_CANCELLED, the PENDING state persists indefinitely. In production, a background job
-  would detect stale PENDING events and alert.
+- **Stale PENDING events**: If ORDER_CREATED never arrives for a pending ORDER_CANCELLED,
+  `PendingReconciliationJob` warns after 10 minutes and escalates to the DLQ after 30 minutes.
+  The event is never auto-resolved — manual intervention is required for DLQ entries.
 - **No authentication/authorization**: The API is open. In production, service-to-service auth
   (JWT, mTLS) would be required.
 - **Single database**: No read replica or CQRS read model. Under heavy read load, a separate

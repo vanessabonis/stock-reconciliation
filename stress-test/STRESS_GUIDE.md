@@ -7,7 +7,7 @@ Este guia permite executar os testes de carga do zero, sem nenhuma instalação 
 ## Pré-requisitos
 
 - Docker Desktop instalado e rodando
-- Portas livres: `8080` (API), `5432` (PostgreSQL), `9092` (Kafka), `9411` (Zipkin), `2181` (Zookeeper)
+- Portas livres: `8080` (API), `5432` (PostgreSQL), `9092` (Kafka), `16686` (Jaeger UI), `4318` (OTLP), `2181` (Zookeeper)
 - Mínimo **4 GB de RAM** alocados para Docker (vá em Docker Desktop → Settings → Resources)
 - Nenhuma outra aplicação usando as portas acima
 
@@ -35,7 +35,7 @@ Verificar o que subiu:
 docker compose ps
 ```
 
-Esperado: `api`, `postgres`, `kafka`, `zookeeper`, `zipkin` — todos com status `Up`.
+Esperado: `api`, `postgres`, `kafka`, `zookeeper`, `jaeger` — todos com status `Up`.
 
 > **Atenção:** se algum container não subiu, verifique com `docker compose logs <nome>`.
 > Kafka pode demorar 20–30s depois do Zookeeper estar Up.
@@ -185,7 +185,7 @@ watch -n 2 'curl -s http://localhost:8080/actuator/health | jq .components.outbo
 docker compose logs -f api
 ```
 
-**Zipkin:** acesse `http://localhost:9411` e busque por `tagQuery=eventType=ORDER_CREATED`
+**Jaeger:** acesse `http://localhost:16686` e busque pelo serviço `gubee-stock-reconciliation`
 para ver traces completos de ponta a ponta (ingestão → DB → outbox → relay).
 
 ---
@@ -257,7 +257,7 @@ curl -s http://localhost:8080/actuator/prometheus | grep gubee_optimistic_lock_r
 adiciona 50ms–100ms de latência. Documentado como comportamento esperado em DECISIONS.md §6.
 
 **Solução em produção:** usar Kafka com partition key `accountId:sku` — eventos do mesmo SKU
-chegam sequencialmente na mesma partition, eliminando o lock contention.
+chegam sequencialmente na mesma partition, eliminando o lock contention (já implementado via Kafka consumer).
 
 ---
 
@@ -356,7 +356,7 @@ docker compose down -v
 
 | Cenário | O que valida | Decisão documentada em |
 |---------|-------------|------------------------|
-| A — Mesmo SKU | Optimistic locking não deixa saldo negativo | DECISIONS.md §6 e §15.1 |
-| B — SKUs diferentes | Throughput horizontal com partitioning | DECISIONS.md §13 e §15.2 |
-| C — Flood idempotência | UNIQUE CONSTRAINT absorve duplicatas | DECISIONS.md §4 |
-| D — Carga realista | Bottleneck sequence real em produção | DECISIONS.md §15.3 |
+| A — Mesmo SKU | Optimistic locking não deixa saldo negativo | DECISIONS.md §6 e §16.1 |
+| B — SKUs diferentes | Throughput horizontal com partitioning | DECISIONS.md §13 e §16.2 |
+| C — Flood idempotência | ON CONFLICT DO NOTHING absorve duplicatas | DECISIONS.md §4 |
+| D — Carga realista | Bottleneck sequence real em produção | DECISIONS.md §16.3 |

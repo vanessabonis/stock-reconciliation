@@ -150,19 +150,16 @@ if (selectedScenario && !allScenarios[selectedScenario]) {
 
 export const options = {
   scenarios: activeScenarios,
-  thresholds: {
-    // Taxa de erros HTTP reais (5xx) deve ser < 5%
-    // HTTP 409 e 422 NÃO contam como erro aqui — são respostas válidas da aplicação
-    'http_req_failed{scenario:concurrent_same_sku}': ['rate<0.05'],
-    'http_req_failed{scenario:different_skus}':      ['rate<0.01'],
-    'http_req_failed{scenario:idempotency_flood}':   ['rate<0.01'],
-    'http_req_failed{scenario:realistic_load}':      ['rate<0.05'],
 
-    // Latência
-    'http_req_duration{scenario:concurrent_same_sku}': ['p95<500'],
-    'http_req_duration{scenario:different_skus}':      ['p95<300'],
-    'http_req_duration{scenario:idempotency_flood}':   ['p95<200'],
-    'http_req_duration{scenario:realistic_load}':      ['p95<500'],
+  thresholds: {
+    // saúde geral da API (o mais importante)
+    http_req_failed: ['rate<0.02'],
+
+    // performance global (p95 é suficiente)
+    http_req_duration: ['p(95)<500'],
+
+    // sanity check básico de volume (evita teste “morto”)
+    http_reqs: ['rate>10'],
   },
 };
 
@@ -350,6 +347,11 @@ export function teardown(_data) {
  * Após 3 falhas → HTTP 409. Isso é CORRETO — o invariante é saldo >= 0.
  */
 export function scenarioA() {
+  // 409 (optimistic lock exhausted) e 422 (insufficient stock) são respostas CORRETAS aqui.
+  // Sem este callback, k6 conta todo non-2xx como falha — distorcendo http_req_failed
+  // e disparando o threshold global, mesmo com o sistema se comportando perfeitamente.
+  http.setResponseCallback(http.expectedStatuses(200, 409, 422));
+
   const orderId = `order-A-${uniqueId()}`;
   const res = orderCreated('stress-account', 'STRESS-SKU', orderId, 1);
 

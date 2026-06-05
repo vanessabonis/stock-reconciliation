@@ -1,4 +1,15 @@
+scheduling:
+  enabled: false   # desabilita OutboxRelay e OutboxPurgeService nos testes — chamados explicitamente quando necessário
+
 spring:
   task:
     scheduling:
       enabled: false
+  kafka:
+    template:
+      observation-enabled: false   # remove overhead de OTel nos sends — sem efeito no comportamento funcional
+
+management:
+  tracing:
+    sampling:
+      probability: 0   # sem sampling em testes — evita que o exportador OTLP tente conectar ao localhost:4318

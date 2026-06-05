@@ -11,6 +11,7 @@ import org.springframework.context.annotation.Configuration;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 
 @Configuration
@@ -155,10 +156,59 @@ public class StockMetrics {
                 .increment();
     }
 
+    // ─── Reconciliation ───────────────────────────────────────────────────────
+
+    // Gauge de backlog: AtomicLong atualizado pelo job a cada execução.
+    // Padrão preferido ao Supplier com query DB: o gauge lê memória, não banco;
+    // a frequência de leitura do Prometheus (15s) não causa N queries adicionais.
+    private final AtomicLong reconciliationBacklog = new AtomicLong(0);
+
+    /**
+     * Atualiza o gauge de backlog com o total de PENDING acima do warn threshold.
+     * Chame no final de cada execução do job, mesmo quando stale.isEmpty().
+     * Query:  gubee_reconciliation_pending_backlog
+     * Alerta: > 0 por mais de duas janelas consecutivas → backlog não está drenando
+     */
+    public void updateReconciliationBacklog(long count) {
+        reconciliationBacklog.set(count);
+    }
+
+    /**
+     * Conta ações tomadas pelo job de reconciliação (warn ou escalação para DLQ).
+     * Query:  rate(gubee_reconciliation_actions_total[15m]) by (action)
+     * Insight: taxa de "dlq" crescente indica deterioração sistêmica no fluxo ORDER_CREATED
+     */
+    public void recordReconciliationAction(String eventType, String action) {
+        Counter.builder("gubee.reconciliation.actions")
+                .description("Actions taken by the pending reconciliation job")
+                .tag("eventType", eventType)
+                .tag("action", action)   // "warn" ou "dlq"
+                .register(registry)
+                .increment();
+    }
+
+    /**
+     * Histograma da idade dos eventos PENDING no momento da detecção.
+     * Cada observação = Duration.between(event.processedAt, now) de um evento stale.
+     * Query:  histogram_quantile(0.95, gubee_reconciliation_pending_age_seconds_bucket)
+     * Insight: p50 próximo ao threshold = backlog drenando normalmente;
+     *          p95 crescente = eventos acumulando sem resolução (provável perda upstream)
+     */
+    public void recordPendingAge(Duration age) {
+        Timer.builder("gubee.reconciliation.pending_age")
+                .description("Age of stale PENDING events at detection time")
+                .register(registry)
+                .record(age);
+    }
+
     // ─── Gauges registered at startup ─────────────────────────────────────────
 
     @PostConstruct
     public void registerGauges() {
+        Gauge.builder("gubee.reconciliation.pending_backlog", reconciliationBacklog, AtomicLong::get)
+                .description("PENDING events currently stale beyond warn threshold (updated by reconciliation job)")
+                .register(registry);
+
         // Rastreia eventos ORDER_CANCELLED aguardando o ORDER_CREATED correspondente.
         // Limite de alerta: > 100 de forma sustentada indica que ORDER_CREATED pode estar se perdendo ou atrasando.
         Gauge.builder("gubee.events.pending.orderstate",

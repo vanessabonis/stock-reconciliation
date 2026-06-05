@@ -1,5 +1,6 @@
 package com.gubee.stockreconciliation.adapter.in.kafka;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.gubee.stockreconciliation.domain.model.StockEvent;
 import com.gubee.stockreconciliation.domain.model.enums.EventType;
@@ -38,9 +39,10 @@ import java.util.Map;
  * Em produção, o Debezium CDC eliminaria essa latência completamente ao
  * monitorar o WAL do PostgreSQL em vez de fazer polling.
  *
- * A idempotência é garantida pela constraint única em processed_events.event_id.
- * Este consumer intencionalmente não faz pré-verificação — a constraint do banco é a guarda.
- * entrega at-least-once (Kafka) + constraint única (banco) = efeito de negócio exactly-once.
+ * A idempotência é garantida pelo INSERT ON CONFLICT DO NOTHING em processed_events.event_id
+ * (guardInsert) executado no início de cada transação de processamento. Se o eventId já existir,
+ * guardInsert retorna 0 e process() retorna IGNORED sem executar lógica de negócio.
+ * entrega at-least-once (Kafka) + ON CONFLICT DO NOTHING (banco) = efeito de negócio exactly-once.
  *
  * Tanto este consumer quanto o endpoint REST (POST /events) chamam o mesmo
  * ProcessStockEventUseCase. O use case não tem conhecimento de como o evento chegou —
@@ -76,8 +78,9 @@ public class StockEventKafkaConsumer {
     )
     public void consume(ConsumerRecord<String, String> record) {
         try {
-            // traceId e spanId já estão no MDC pela bridge do Brave tracing.
+            // traceId e spanId já estão no MDC pela bridge do OTel tracing.
             // enrichKafka() adiciona campos específicos de transporte que não estão no contexto de trace.
+            log.debug("payload={}", record.value());
             EventProcessingContext.enrichKafka(record);
             log.info("kafka.message.received partition={} offset={}", record.partition(), record.offset());
 
@@ -86,10 +89,19 @@ public class StockEventKafkaConsumer {
 
             var status = processStockEventUseCase.process(event);
             log.info("kafka.event.processed status={}", status);
-        } catch (Exception e) {
-            log.error("kafka.message.routed_to_dlq partition={} offset={} error={}",
+        } catch (JsonProcessingException | IllegalArgumentException e) {
+            log.error("kafka.message.parse_error partition={} offset={} error={}",
                     record.partition(), record.offset(), e.getMessage());
-            throw new RuntimeException("Failed to process Kafka message at offset " + record.offset(), e);
+            throw new NonRetryableMessageException(
+                    "Non-retryable parse failure at partition=" + record.partition() + " offset=" + record.offset(), e);
+        } catch (Exception e) {
+            // Retryable: transient failure (DB unavailable, optimistic lock, network timeout).
+            // Spring Kafka will apply exponential backoff before routing to DLQ.
+            // "routed_to_dlq" is logged by KafkaConsumerConfig recoverer only on final exhaustion.
+            log.error("kafka.message.processing_error partition={} offset={} error={}",
+                    record.partition(), record.offset(), e.getMessage());
+            throw new RuntimeException(
+                    "Retryable processing failure at partition=" + record.partition() + " offset=" + record.offset(), e);
         } finally {
             EventProcessingContext.clear();
         }

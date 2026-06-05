@@ -85,6 +85,9 @@ public class StockEventController {
             case IGNORED -> HttpStatus.OK;
             case PENDING -> HttpStatus.ACCEPTED;
             case INCONSISTENT -> HttpStatus.UNPROCESSABLE_ENTITY;
+            // PROCESSING is a transient sentinel that must never reach this layer.
+            // If it does, it indicates a serious bug (transaction rolled back mid-way).
+            case PROCESSING -> HttpStatus.INTERNAL_SERVER_ERROR;
         };
     }
 
@@ -94,6 +97,7 @@ public class StockEventController {
             case IGNORED -> "Event acknowledged; no balance change applied";
             case PENDING -> "Event received; waiting for prerequisite event";
             case INCONSISTENT -> "Event conflicts with current state; recorded but not applied";
+            case PROCESSING -> "Internal error: event left in transient PROCESSING state";
         };
     }
 }

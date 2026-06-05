@@ -1,9 +1,6 @@
 package com.gubee.stockreconciliation.integration;
 
 import com.gubee.stockreconciliation.adapter.out.kafka.OutboxRelay;
-import com.gubee.stockreconciliation.domain.model.enums.EventStatus;
-import com.gubee.stockreconciliation.domain.model.enums.EventType;
-import com.gubee.stockreconciliation.domain.model.enums.OrderLifecycleState;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -18,7 +15,6 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.TestPropertySource;
 
-import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -38,28 +34,28 @@ import static org.assertj.core.api.Assertions.assertThat;
 })
 class StockReconciliationIntegrationTest {
 
-    // The OutboxRelay is mocked here because this test suite has no Kafka broker.
-    // Without this mock, the @Scheduled relay would hold DB connections for 5s per entry
-    // (waiting for Kafka sends to time out), starving the connection pool mid-test.
-    // The relay's correctness is covered by StockEventKafkaConsumerIntegrationTest.
+    // OutboxRelay is mocked — no Kafka broker in this suite.
+    // Without this mock, the relay would hold DB connections waiting for Kafka sends to time out.
+    // Relay correctness is covered by StockEventKafkaConsumerIntegrationTest.
     @MockBean
     OutboxRelay outboxRelay;
 
-    @LocalServerPort
-    int port;
-
-    @Autowired
-    TestRestTemplate restTemplate;
-
-    @Autowired
-    JdbcTemplate jdbcTemplate;
+    @LocalServerPort int port;
+    @Autowired TestRestTemplate restTemplate;
+    @Autowired JdbcTemplate jdbcTemplate;
 
     private String baseUrl;
+
+    // Realistic identifiers matching teste-local.http
+    private static final String VENDEDOR_NIKE  = "vendedor-nike";
+    private static final String VENDEDOR_APPLE = "vendedor-apple";
+    private static final String SKU            = "TENIS-NIKE-AIRMAX-41";
+    private static final String MARKETPLACE    = "MERCADO_LIVRE";
 
     @BeforeEach
     void setUp() {
         baseUrl = "http://localhost:" + port;
-        jdbcTemplate.execute("TRUNCATE TABLE stock_history, order_states, processed_events, stocks RESTART IDENTITY CASCADE");
+        jdbcTemplate.execute("TRUNCATE TABLE outbox_events, stock_history, order_states, processed_events, stocks RESTART IDENTITY CASCADE");
     }
 
     // ─── Helpers ────────────────────────────────────────────────────────────
@@ -76,55 +72,59 @@ class StockReconciliationIntegrationTest {
         return (String) resp.getBody().get("status");
     }
 
-    private Map stockAdjustedEvent(String eventId, String accountId, String sku, int available) {
-        Map<String, Object> event = new LinkedHashMap<>();
-        event.put("eventId", eventId);
-        event.put("type", "STOCK_ADJUSTED");
-        event.put("occurredAt", Instant.now().toString());
-        event.put("accountId", accountId);
-        event.put("sku", sku);
-        event.put("available", available);
-        event.put("reason", "test");
-        return event;
+    private Map<String, Object> stockAdjustedEvent(String eventId, String accountId, String sku,
+                                                    int available, String reason) {
+        Map<String, Object> e = new LinkedHashMap<>();
+        e.put("eventId", eventId);
+        e.put("type", "STOCK_ADJUSTED");
+        e.put("occurredAt", "2026-05-28T10:00:00Z");
+        e.put("accountId", accountId);
+        e.put("sku", sku);
+        e.put("available", available);
+        e.put("reason", reason);
+        return e;
     }
 
-    private Map orderCreatedEvent(String eventId, String accountId, String sku, int qty, String orderId) {
-        Map<String, Object> event = new LinkedHashMap<>();
-        event.put("eventId", eventId);
-        event.put("type", "ORDER_CREATED");
-        event.put("occurredAt", Instant.now().toString());
-        event.put("accountId", accountId);
-        event.put("sku", sku);
-        event.put("marketplace", "MERCADO_LIVRE");
-        event.put("externalOrderId", orderId);
-        event.put("quantity", qty);
-        return event;
+    private Map<String, Object> orderCreatedEvent(String eventId, String accountId, String sku,
+                                                   int qty, String orderId) {
+        Map<String, Object> e = new LinkedHashMap<>();
+        e.put("eventId", eventId);
+        e.put("type", "ORDER_CREATED");
+        e.put("occurredAt", "2026-05-28T10:05:00Z");
+        e.put("accountId", accountId);
+        e.put("sku", sku);
+        e.put("marketplace", MARKETPLACE);
+        e.put("externalOrderId", orderId);
+        e.put("quantity", qty);
+        return e;
     }
 
-    private Map orderCancelledEvent(String eventId, String accountId, String sku, int qty, String orderId) {
-        Map<String, Object> event = new LinkedHashMap<>();
-        event.put("eventId", eventId);
-        event.put("type", "ORDER_CANCELLED");
-        event.put("occurredAt", Instant.now().toString());
-        event.put("accountId", accountId);
-        event.put("sku", sku);
-        event.put("marketplace", "MERCADO_LIVRE");
-        event.put("externalOrderId", orderId);
-        event.put("quantity", qty);
-        return event;
+    private Map<String, Object> orderCancelledEvent(String eventId, String accountId, String sku,
+                                                     int qty, String orderId) {
+        Map<String, Object> e = new LinkedHashMap<>();
+        e.put("eventId", eventId);
+        e.put("type", "ORDER_CANCELLED");
+        e.put("occurredAt", "2026-05-28T10:10:00Z");
+        e.put("accountId", accountId);
+        e.put("sku", sku);
+        e.put("marketplace", MARKETPLACE);
+        e.put("externalOrderId", orderId);
+        e.put("quantity", qty);
+        return e;
     }
 
-    private Map marketplaceRestoredEvent(String eventId, String accountId, String sku, int qty, String orderId) {
-        Map<String, Object> event = new LinkedHashMap<>();
-        event.put("eventId", eventId);
-        event.put("type", "MARKETPLACE_STOCK_RESTORED");
-        event.put("occurredAt", Instant.now().toString());
-        event.put("accountId", accountId);
-        event.put("sku", sku);
-        event.put("marketplace", "MERCADO_LIVRE");
-        event.put("externalOrderId", orderId);
-        event.put("quantity", qty);
-        return event;
+    private Map<String, Object> marketplaceRestoredEvent(String eventId, String accountId, String sku,
+                                                          int qty, String orderId) {
+        Map<String, Object> e = new LinkedHashMap<>();
+        e.put("eventId", eventId);
+        e.put("type", "MARKETPLACE_STOCK_RESTORED");
+        e.put("occurredAt", "2026-05-28T10:35:00Z");
+        e.put("accountId", accountId);
+        e.put("sku", sku);
+        e.put("marketplace", MARKETPLACE);
+        e.put("externalOrderId", orderId);
+        e.put("quantity", qty);
+        return e;
     }
 
     private int currentStock(String accountId, String sku) {
@@ -134,10 +134,10 @@ class StockReconciliationIntegrationTest {
         return qty != null ? qty : -1;
     }
 
-    private String orderState(String marketplace, String accountId, String externalOrderId, String sku) {
+    private String orderState(String accountId, String orderId, String sku) {
         return jdbcTemplate.queryForObject(
                 "SELECT state FROM order_states WHERE marketplace=? AND account_id=? AND external_order_id=? AND sku=?",
-                String.class, marketplace, accountId, externalOrderId, sku);
+                String.class, MARKETPLACE, accountId, orderId, sku);
     }
 
     private String eventStatus(String eventId) {
@@ -146,152 +146,144 @@ class StockReconciliationIntegrationTest {
                 String.class, eventId);
     }
 
-    // ─── Scenario 1: Stock adjusted ─────────────────────────────────────────
+    // ─── Cenário 1: Ajuste inicial de estoque ───────────────────────────────
 
     @Test
-    @DisplayName("Scenario 1: STOCK_ADJUSTED available=10 → stock=10")
-    void scenario1_stockAdjusted() {
-        var resp = postEvent(stockAdjustedEvent("evt-s1-001", "acc-001", "SKU-A", 10));
+    @DisplayName("Cenário 1: STOCK_ADJUSTED available=10 → saldo=10")
+    void cenario1_ajusteInicialDeEstoque() {
+        var resp = postEvent(stockAdjustedEvent("evt-001", VENDEDOR_NIKE, SKU, 10, "inventario_inicial"));
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(statusOf(resp)).isEqualTo("PROCESSED");
-        assertThat(currentStock("acc-001", "SKU-A")).isEqualTo(10);
+        assertThat(currentStock(VENDEDOR_NIKE, SKU)).isEqualTo(10);
     }
 
-    // ─── Scenario 2: Order reduces stock ────────────────────────────────────
+    // ─── Cenário 2: Pedido baixa o estoque ──────────────────────────────────
 
     @Test
-    @DisplayName("Scenario 2: STOCK_ADJUSTED=10 + ORDER_CREATED qty=2 → stock=8")
-    void scenario2_orderReducesStock() {
-        postEvent(stockAdjustedEvent("evt-s2-001", "acc-001", "SKU-B", 10));
-        var resp = postEvent(orderCreatedEvent("evt-s2-002", "acc-001", "SKU-B", 2, "ML-200"));
+    @DisplayName("Cenário 2: STOCK_ADJUSTED=10 + ORDER_CREATED qty=2 → saldo=8")
+    void cenario2_pedidoBaixaEstoque() {
+        postEvent(stockAdjustedEvent("evt-001", VENDEDOR_NIKE, SKU, 10, "inventario_inicial"));
+        var resp = postEvent(orderCreatedEvent("evt-002", VENDEDOR_NIKE, SKU, 2, "PEDIDO-NIKE-001"));
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(statusOf(resp)).isEqualTo("PROCESSED");
-        assertThat(currentStock("acc-001", "SKU-B")).isEqualTo(8);
+        assertThat(currentStock(VENDEDOR_NIKE, SKU)).isEqualTo(8);
     }
 
-    // ─── Scenario 3: Cancellation restores stock ────────────────────────────
+    // ─── Cenário 3: Cancelamento devolve o estoque ──────────────────────────
 
     @Test
-    @DisplayName("Scenario 3: ORDER_CREATED qty=2 + ORDER_CANCELLED → stock restores")
-    void scenario3_cancellationRestoresStock() {
-        postEvent(stockAdjustedEvent("evt-s3-001", "acc-001", "SKU-C", 10));
-        postEvent(orderCreatedEvent("evt-s3-002", "acc-001", "SKU-C", 2, "ML-300"));
-        assertThat(currentStock("acc-001", "SKU-C")).isEqualTo(8);
+    @DisplayName("Cenário 3: ORDER_CREATED + ORDER_CANCELLED → saldo restaurado para 10")
+    void cenario3_cancelamentoDevolveEstoque() {
+        postEvent(stockAdjustedEvent("evt-001", VENDEDOR_NIKE, SKU, 10, "inventario_inicial"));
+        postEvent(orderCreatedEvent("evt-002", VENDEDOR_NIKE, SKU, 2, "PEDIDO-NIKE-001"));
+        assertThat(currentStock(VENDEDOR_NIKE, SKU)).isEqualTo(8);
 
-        var resp = postEvent(orderCancelledEvent("evt-s3-003", "acc-001", "SKU-C", 2, "ML-300"));
+        var resp = postEvent(orderCancelledEvent("evt-003", VENDEDOR_NIKE, SKU, 2, "PEDIDO-NIKE-001"));
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(statusOf(resp)).isEqualTo("PROCESSED");
-        assertThat(currentStock("acc-001", "SKU-C")).isEqualTo(10);
-        assertThat(orderState("MERCADO_LIVRE", "acc-001", "ML-300", "SKU-C"))
-                .isEqualTo("CANCELLED");
+        assertThat(currentStock(VENDEDOR_NIKE, SKU)).isEqualTo(10);
+        assertThat(orderState(VENDEDOR_NIKE, "PEDIDO-NIKE-001", SKU)).isEqualTo("CANCELLED");
     }
 
-    // ─── Scenario 4: Duplicate eventId ──────────────────────────────────────
+    // ─── Cenário 4: Idempotência por eventId ────────────────────────────────
 
     @Test
-    @DisplayName("Scenario 4: Same eventId processed twice — stock changes only once")
-    void scenario4_duplicateEventId() {
-        postEvent(stockAdjustedEvent("evt-s4-001", "acc-001", "SKU-D", 10));
+    @DisplayName("Cenário 4: mesmo eventId enviado duas vezes → segundo retorna IGNORED, saldo inalterado")
+    void cenario4_idempotenciaPorEventId() {
+        postEvent(stockAdjustedEvent("evt-001", VENDEDOR_NIKE, SKU, 10, "inventario_inicial"));
+        postEvent(orderCreatedEvent("evt-002", VENDEDOR_NIKE, SKU, 2, "PEDIDO-NIKE-001"));
+        assertThat(currentStock(VENDEDOR_NIKE, SKU)).isEqualTo(8);
 
-        postEvent(orderCreatedEvent("evt-s4-002", "acc-001", "SKU-D", 2, "ML-400"));
-        assertThat(currentStock("acc-001", "SKU-D")).isEqualTo(8);
+        // Reenvio exato do evt-001 (mesmo eventId, mesmo body)
+        var segundaVez = postEvent(stockAdjustedEvent("evt-001", VENDEDOR_NIKE, SKU, 10, "inventario_inicial"));
+        assertThat(segundaVez.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(statusOf(segundaVez)).isEqualTo("IGNORED");
 
-        // Send the exact same ORDER_CREATED again
-        var secondResp = postEvent(orderCreatedEvent("evt-s4-002", "acc-001", "SKU-D", 2, "ML-400"));
-        assertThat(secondResp.getStatusCode()).isEqualTo(HttpStatus.OK);
-        assertThat(statusOf(secondResp)).isEqualTo("IGNORED");
+        // Saldo não pode ter voltado para 10 — idempotência garantida pela unique constraint em event_id
+        assertThat(currentStock(VENDEDOR_NIKE, SKU)).isEqualTo(8);
 
-        // Stock must still be 8, not 6
-        assertThat(currentStock("acc-001", "SKU-D")).isEqualTo(8);
-
-        // Only one processed_events row for this eventId
         int count = jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM processed_events WHERE event_id = 'evt-s4-002'", Integer.class);
+                "SELECT COUNT(*) FROM processed_events WHERE event_id = 'evt-001'", Integer.class);
         assertThat(count).isEqualTo(1);
     }
 
-    // ─── Scenario 5: Duplicate cancellation ────────────────────────────────
+    // ─── Cenário 5: Cancelamento duplicado (duplicidade lógica) ─────────────
 
     @Test
-    @DisplayName("Scenario 5: Two ORDER_CANCELLED for same order — stock restored only once")
-    void scenario5_duplicateCancellation() {
-        postEvent(stockAdjustedEvent("evt-s5-001", "acc-001", "SKU-E", 10));
-        postEvent(orderCreatedEvent("evt-s5-002", "acc-001", "SKU-E", 2, "ML-500"));
-        postEvent(orderCancelledEvent("evt-s5-003", "acc-001", "SKU-E", 2, "ML-500"));
-        assertThat(currentStock("acc-001", "SKU-E")).isEqualTo(10);
+    @DisplayName("Cenário 5: dois ORDER_CANCELLED para o mesmo pedido → segundo retorna INCONSISTENT, saldo=10")
+    void cenario5_cancelamentoDuplicado() {
+        postEvent(stockAdjustedEvent("evt-001", VENDEDOR_NIKE, SKU, 10, "inventario_inicial"));
+        postEvent(orderCreatedEvent("evt-002", VENDEDOR_NIKE, SKU, 2, "PEDIDO-NIKE-001"));
+        postEvent(orderCancelledEvent("evt-003", VENDEDOR_NIKE, SKU, 2, "PEDIDO-NIKE-001"));
+        assertThat(currentStock(VENDEDOR_NIKE, SKU)).isEqualTo(10);
 
-        // Second cancellation for the same order (different eventId)
-        var resp = postEvent(orderCancelledEvent("evt-s5-004", "acc-001", "SKU-E", 2, "ML-500"));
+        // Segundo cancelamento do PEDIDO-NIKE-001 com eventId diferente (evt-004)
+        var resp = postEvent(orderCancelledEvent("evt-004", VENDEDOR_NIKE, SKU, 2, "PEDIDO-NIKE-001"));
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
         assertThat(statusOf(resp)).isEqualTo("INCONSISTENT");
-
-        // Stock must remain 10, not go to 12
-        assertThat(currentStock("acc-001", "SKU-E")).isEqualTo(10);
-        assertThat(eventStatus("evt-s5-004")).isEqualTo("INCONSISTENT");
+        // Saldo não pode ter ido para 12 — OrderState já era CANCELLED
+        assertThat(currentStock(VENDEDOR_NIKE, SKU)).isEqualTo(10);
+        assertThat(eventStatus("evt-004")).isEqualTo("INCONSISTENT");
     }
 
-    // ─── Scenario 6: Out-of-order cancellation ──────────────────────────────
+    // ─── Cenário 6: Cancelamento antes do pedido (fora de ordem) ────────────
 
     @Nested
-    @DisplayName("Scenario 6: ORDER_CANCELLED before ORDER_CREATED")
-    class Scenario6OutOfOrder {
+    @DisplayName("Cenário 6: ORDER_CANCELLED chega antes do ORDER_CREATED")
+    class Cenario6ForaDeOrdem {
 
         @Test
-        @DisplayName("6a: ORDER_CANCELLED is held as PENDING")
-        void cancelledBeforeCreated_isHeldPending() {
-            postEvent(stockAdjustedEvent("evt-s6-001", "acc-001", "SKU-F", 10));
+        @DisplayName("6a: ORDER_CANCELLED é mantido como PENDING — saldo inalterado")
+        void cancelamento_antesDaPedicao_ficaPending() {
+            postEvent(stockAdjustedEvent("evt-001", VENDEDOR_NIKE, SKU, 10, "inventario_inicial"));
 
-            // ORDER_CANCELLED arrives first
-            var cancelResp = postEvent(orderCancelledEvent("evt-s6-002", "acc-001", "SKU-F", 2, "ML-600"));
+            // Cancelamento do PEDIDO-NIKE-002 que ainda não existe no sistema
+            var cancelResp = postEvent(orderCancelledEvent("evt-005", VENDEDOR_NIKE, SKU, 2, "PEDIDO-NIKE-002"));
             assertThat(cancelResp.getStatusCode()).isEqualTo(HttpStatus.ACCEPTED);
             assertThat(statusOf(cancelResp)).isEqualTo("PENDING");
 
-            // Stock unchanged
-            assertThat(currentStock("acc-001", "SKU-F")).isEqualTo(10);
-            assertThat(eventStatus("evt-s6-002")).isEqualTo("PENDING");
+            // Saldo não muda — cancelamento suspenso aguardando ORDER_CREATED
+            assertThat(currentStock(VENDEDOR_NIKE, SKU)).isEqualTo(10);
+            assertThat(eventStatus("evt-005")).isEqualTo("PENDING");
         }
 
         @Test
-        @DisplayName("6b: ORDER_CREATED resolves PENDING atomically — net stock change = 0")
-        void createdAfterCancelled_resolvesAtomically() {
-            postEvent(stockAdjustedEvent("evt-s6a-001", "acc-001", "SKU-G", 10));
-            postEvent(orderCancelledEvent("evt-s6a-002", "acc-001", "SKU-G", 2, "ML-601"));
+        @DisplayName("6b: ORDER_CREATED resolve PENDING atomicamente — delta líquido = 0, saldo=10")
+        void criacao_tardia_resolveAtomicamente() {
+            postEvent(stockAdjustedEvent("evt-001", VENDEDOR_NIKE, SKU, 10, "inventario_inicial"));
+            // Cancelamento chegou primeiro
+            postEvent(orderCancelledEvent("evt-005", VENDEDOR_NIKE, SKU, 2, "PEDIDO-NIKE-002"));
 
-            // ORDER_CREATED arrives later
-            var createdResp = postEvent(orderCreatedEvent("evt-s6a-003", "acc-001", "SKU-G", 2, "ML-601"));
+            // Criação tardia do PEDIDO-NIKE-002 (que já havia sido cancelado)
+            var createdResp = postEvent(orderCreatedEvent("evt-006", VENDEDOR_NIKE, SKU, 2, "PEDIDO-NIKE-002"));
             assertThat(createdResp.getStatusCode()).isEqualTo(HttpStatus.OK);
             assertThat(statusOf(createdResp)).isEqualTo("PROCESSED");
 
-            // Net stock change = 0
-            assertThat(currentStock("acc-001", "SKU-G")).isEqualTo(10);
+            // Delta líquido = 0: subtract (ORDER_CREATED) + add-back (ORDER_CANCELLED) na mesma transação
+            assertThat(currentStock(VENDEDOR_NIKE, SKU)).isEqualTo(10);
+            assertThat(eventStatus("evt-005")).isEqualTo("PROCESSED");
+            assertThat(eventStatus("evt-006")).isEqualTo("PROCESSED");
+            assertThat(orderState(VENDEDOR_NIKE, "PEDIDO-NIKE-002", SKU)).isEqualTo("CANCELLED");
 
-            // Both events now PROCESSED
-            assertThat(eventStatus("evt-s6a-002")).isEqualTo("PROCESSED");
-            assertThat(eventStatus("evt-s6a-003")).isEqualTo("PROCESSED");
-
-            // Order state = CANCELLED
-            assertThat(orderState("MERCADO_LIVRE", "acc-001", "ML-601", "SKU-G")).isEqualTo("CANCELLED");
-
-            // Audit trail: 3 entries (STOCK_ADJUSTED + ORDER_CREATED subtract + ORDER_CANCELLED add-back)
+            // Audit trail: STOCK_ADJUSTED + ORDER_CREATED subtract + ORDER_CANCELLED add-back
             int historyCount = jdbcTemplate.queryForObject(
                     "SELECT COUNT(*) FROM stock_history sh " +
                     "JOIN stocks s ON s.id = sh.stock_id " +
-                    "WHERE s.account_id = 'acc-001' AND s.sku = 'SKU-G'", Integer.class);
+                    "WHERE s.account_id = ? AND s.sku = ?", Integer.class, VENDEDOR_NIKE, SKU);
             assertThat(historyCount).isEqualTo(3);
         }
     }
 
-    // ─── Scenario 7: Concurrent ORDER_CREATED — no negative stock ───────────
+    // ─── Cenário 7: ORDER_CREATED concorrentes — saldo nunca negativo ────────
 
     @Test
-    @DisplayName("Scenario 7: Concurrent ORDER_CREATED events — stock never goes negative")
-    void scenario7_concurrentOrdersNoNegativeStock() throws InterruptedException {
-        // Set stock to 5 units
-        postEvent(stockAdjustedEvent("evt-s7-001", "acc-007", "SKU-H", 5));
+    @DisplayName("Cenário 7: 10 ORDER_CREATED concorrentes com estoque=5 → saldo ≥ 0 e sucesso+saldo=5")
+    void cenario7_pedidosConcorrentesNaoNegativoEstoque() throws InterruptedException {
+        postEvent(stockAdjustedEvent("evt-001", VENDEDOR_NIKE, SKU, 5, "inventario_inicial"));
 
         int threads = 10;
         CountDownLatch ready = new CountDownLatch(threads);
@@ -304,20 +296,11 @@ class StockReconciliationIntegrationTest {
             final int idx = i;
             pool.submit(() -> {
                 ready.countDown();
-                try {
-                    start.await();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return;
-                }
-                Map<String, Object> event = orderCreatedEvent(
-                        "evt-s7-order-" + idx, "acc-007", "SKU-H", 1, "ML-700-" + idx);
-                var resp = postEvent(event);
-                if (resp.getStatusCode() == HttpStatus.OK) {
-                    successCount.incrementAndGet();
-                } else {
-                    conflictOrErrorCount.incrementAndGet();
-                }
+                try { start.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
+                var resp = postEvent(orderCreatedEvent(
+                        "evt-conc-" + idx, VENDEDOR_NIKE, SKU, 1, "PEDIDO-NIKE-CONC-" + idx));
+                if (resp.getStatusCode() == HttpStatus.OK) successCount.incrementAndGet();
+                else conflictOrErrorCount.incrementAndGet();
             });
         }
 
@@ -326,71 +309,69 @@ class StockReconciliationIntegrationTest {
         pool.shutdown();
         pool.awaitTermination(30, TimeUnit.SECONDS);
 
-        int remaining = currentStock("acc-007", "SKU-H");
+        int remaining = currentStock(VENDEDOR_NIKE, SKU);
         assertThat(remaining).isGreaterThanOrEqualTo(0);
         assertThat(successCount.get()).isLessThanOrEqualTo(5);
-        // successful orders + remaining stock must equal initial stock
         assertThat(successCount.get() + remaining).isEqualTo(5);
     }
 
-    // ─── Scenario 8: Marketplace restoration + Cancellation ────────────────
+    // ─── Cenário 8: Recomposição do marketplace + cancelamento tardio ─────────
 
     @Nested
-    @DisplayName("Scenario 8: MARKETPLACE_STOCK_RESTORED and ORDER_CANCELLED — no double restoration")
-    class Scenario8NoDoubleRestoration {
+    @DisplayName("Cenário 8: MARKETPLACE_STOCK_RESTORED e ORDER_CANCELLED — sem dupla restauração")
+    class Cenario8SemDuplaRestauracao {
 
         @Test
-        @DisplayName("8a: ORDER_CANCELLED after MARKETPLACE_STOCK_RESTORED → INCONSISTENT")
-        void cancelledAfterRestored_isInconsistent() {
-            postEvent(stockAdjustedEvent("evt-s8a-001", "acc-001", "SKU-I", 10));
-            postEvent(orderCreatedEvent("evt-s8a-002", "acc-001", "SKU-I", 2, "ML-800"));
-            assertThat(currentStock("acc-001", "SKU-I")).isEqualTo(8);
+        @DisplayName("8a: ORDER_CANCELLED após MARKETPLACE_STOCK_RESTORED → INCONSISTENT, saldo=10")
+        void cancelamentoAposRestauracao_inconsistente() {
+            postEvent(stockAdjustedEvent("evt-001", VENDEDOR_NIKE, SKU, 10, "inventario_inicial"));
+            postEvent(orderCreatedEvent("evt-007", VENDEDOR_NIKE, SKU, 3, "PEDIDO-NIKE-003"));
+            assertThat(currentStock(VENDEDOR_NIKE, SKU)).isEqualTo(7);
 
-            // Marketplace restores first
-            var restoreResp = postEvent(marketplaceRestoredEvent("evt-s8a-003", "acc-001", "SKU-I", 2, "ML-800"));
+            // Marketplace restaura primeiro (evt-008)
+            var restoreResp = postEvent(marketplaceRestoredEvent("evt-008", VENDEDOR_NIKE, SKU, 3, "PEDIDO-NIKE-003"));
             assertThat(restoreResp.getStatusCode()).isEqualTo(HttpStatus.OK);
             assertThat(statusOf(restoreResp)).isEqualTo("PROCESSED");
-            assertThat(currentStock("acc-001", "SKU-I")).isEqualTo(10);
+            assertThat(currentStock(VENDEDOR_NIKE, SKU)).isEqualTo(10);
 
-            // ORDER_CANCELLED arrives after — should be rejected
-            var cancelResp = postEvent(orderCancelledEvent("evt-s8a-004", "acc-001", "SKU-I", 2, "ML-800"));
+            // Cancelamento tardio do mesmo pedido (evt-009) — deve ser bloqueado
+            var cancelResp = postEvent(orderCancelledEvent("evt-009", VENDEDOR_NIKE, SKU, 3, "PEDIDO-NIKE-003"));
             assertThat(cancelResp.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
             assertThat(statusOf(cancelResp)).isEqualTo("INCONSISTENT");
-
-            // Stock must remain 10, not go to 12
-            assertThat(currentStock("acc-001", "SKU-I")).isEqualTo(10);
+            // Saldo não pode ter ido para 13 — segunda restauração bloqueada pela state machine
+            assertThat(currentStock(VENDEDOR_NIKE, SKU)).isEqualTo(10);
         }
 
         @Test
-        @DisplayName("8b: MARKETPLACE_STOCK_RESTORED after ORDER_CANCELLED → INCONSISTENT")
-        void restoredAfterCancelled_isInconsistent() {
-            postEvent(stockAdjustedEvent("evt-s8b-001", "acc-001", "SKU-J", 10));
-            postEvent(orderCreatedEvent("evt-s8b-002", "acc-001", "SKU-J", 2, "ML-801"));
-            postEvent(orderCancelledEvent("evt-s8b-003", "acc-001", "SKU-J", 2, "ML-801"));
-            assertThat(currentStock("acc-001", "SKU-J")).isEqualTo(10);
+        @DisplayName("8b: MARKETPLACE_STOCK_RESTORED após ORDER_CANCELLED → INCONSISTENT, saldo=10")
+        void restauracaoAposCancelamento_inconsistente() {
+            postEvent(stockAdjustedEvent("evt-001", VENDEDOR_NIKE, SKU, 10, "inventario_inicial"));
+            postEvent(orderCreatedEvent("evt-007", VENDEDOR_NIKE, SKU, 3, "PEDIDO-NIKE-003"));
+            postEvent(orderCancelledEvent("evt-003", VENDEDOR_NIKE, SKU, 3, "PEDIDO-NIKE-003"));
+            assertThat(currentStock(VENDEDOR_NIKE, SKU)).isEqualTo(10);
 
-            // Marketplace tries to restore after cancellation — should be rejected
-            var resp = postEvent(marketplaceRestoredEvent("evt-s8b-004", "acc-001", "SKU-J", 2, "ML-801"));
+            // Marketplace tenta restaurar após cancelamento — deve ser rejeitado
+            var resp = postEvent(marketplaceRestoredEvent("evt-008", VENDEDOR_NIKE, SKU, 3, "PEDIDO-NIKE-003"));
             assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
             assertThat(statusOf(resp)).isEqualTo("INCONSISTENT");
-
-            // Stock must remain 10, not go to 12
-            assertThat(currentStock("acc-001", "SKU-J")).isEqualTo(10);
+            assertThat(currentStock(VENDEDOR_NIKE, SKU)).isEqualTo(10);
         }
     }
 
-    // ─── Multi-account isolation ─────────────────────────────────────────────
+    // ─── Cenário 9: Isolamento multi-conta ──────────────────────────────────
 
     @Test
-    @DisplayName("Multi-account: same SKU in different accounts is independent")
-    void multiAccountIsolation() {
-        postEvent(stockAdjustedEvent("evt-ma-001", "acc-A", "SKU-Z", 10));
-        postEvent(stockAdjustedEvent("evt-ma-002", "acc-B", "SKU-Z", 20));
+    @DisplayName("Cenário 9: mesmo SKU em vendedores diferentes tem saldos independentes")
+    void cenario9_isolamentoMultiConta() {
+        // vendedor-nike tem 10 unidades
+        postEvent(stockAdjustedEvent("evt-001", VENDEDOR_NIKE, SKU, 10, "inventario_inicial"));
+        // vendedor-apple tem 50 unidades do mesmo SKU — saldos são independentes
+        postEvent(stockAdjustedEvent("evt-011", VENDEDOR_APPLE, SKU, 50, "estoque_vendedor_apple"));
 
-        postEvent(orderCreatedEvent("evt-ma-003", "acc-A", "SKU-Z", 3, "ML-A1"));
-        postEvent(orderCreatedEvent("evt-ma-004", "acc-B", "SKU-Z", 5, "ML-B1"));
+        postEvent(orderCreatedEvent("evt-002", VENDEDOR_NIKE,  SKU, 2, "PEDIDO-NIKE-001"));
+        postEvent(orderCreatedEvent("evt-apple-001", VENDEDOR_APPLE, SKU, 5, "PEDIDO-APPLE-001"));
 
-        assertThat(currentStock("acc-A", "SKU-Z")).isEqualTo(7);
-        assertThat(currentStock("acc-B", "SKU-Z")).isEqualTo(15);
+        assertThat(currentStock(VENDEDOR_NIKE,  SKU)).isEqualTo(8);
+        assertThat(currentStock(VENDEDOR_APPLE, SKU)).isEqualTo(45);
     }
 }

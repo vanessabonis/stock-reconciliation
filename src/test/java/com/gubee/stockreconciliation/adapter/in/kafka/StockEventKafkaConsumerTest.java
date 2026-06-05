@@ -93,11 +93,22 @@ class StockEventKafkaConsumerTest {
     }
 
     @Test
-    void consume_malformedJson_throwsRuntimeException() {
+    void consume_malformedJson_throwsNonRetryableMessageException() {
         ConsumerRecord<String, String> record = new ConsumerRecord<>("stock-events", 0, 0L, "key", "not-valid-json");
 
         assertThatThrownBy(() -> consumer.consume(record))
-                .isInstanceOf(RuntimeException.class)
-                .hasMessageContaining("Failed to process Kafka message");
+                .isInstanceOf(NonRetryableMessageException.class);
+    }
+
+    @Test
+    void consume_unknownEventType_throwsNonRetryableMessageException() {
+        String json = """
+                {"eventId":"e5","type":"UNKNOWN_TYPE","occurredAt":"%s",
+                 "accountId":"acc-1","sku":"SKU-1"}
+                """.formatted(Instant.now()).strip();
+        ConsumerRecord<String, String> record = new ConsumerRecord<>("stock-events", 0, 0L, "key", json);
+
+        assertThatThrownBy(() -> consumer.consume(record))
+                .isInstanceOf(NonRetryableMessageException.class);
     }
 }

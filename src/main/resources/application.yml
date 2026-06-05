@@ -63,6 +63,8 @@ spring:
         enable.idempotence: true
         max.in.flight.requests.per.connection: 5
         delivery.timeout.ms: 120000
+    template:
+      observation-enabled: true   # propaga W3C traceparent automaticamente nas mensagens Kafka
     consumer:
       enable-auto-commit: false   # commit manual via AckMode.BATCH
       auto-offset-reset: earliest
@@ -92,9 +94,14 @@ management:
   tracing:
     sampling:
       probability: 1.0   # 100% em desenvolvimento; reduza para 0.1 em produção
-  zipkin:
+  otlp:
     tracing:
-      endpoint: ${ZIPKIN_ENDPOINT:http://localhost:9411/api/v2/spans}
+      endpoint: ${OTLP_ENDPOINT:http://localhost:4318/v1/traces}
+
+reconciliation:
+  pending-threshold-minutes: ${RECONCILIATION_PENDING_THRESHOLD_MINUTES:10}
+  dlq-threshold-minutes: ${RECONCILIATION_DLQ_THRESHOLD_MINUTES:30}
+  check-interval-ms: ${RECONCILIATION_CHECK_INTERVAL_MS:300000}
 
 springdoc:
   api-docs:
@@ -104,22 +111,16 @@ springdoc:
 
 logging:
   level:
-    com.gubee.stockreconciliation: INFO
+    root: WARN
 
-    # Spring base (evita ruído excessivo)
+    com.gubee.stockreconciliation: DEBUG
+
+    com.gubee.stockreconciliation.adapter.in.kafka: DEBUG
+    com.gubee.stockreconciliation.application: INFO
+
     org.springframework: WARN
-
-    # Kafka (nível correto para debug sem virar flood)
-    org.springframework.kafka: INFO
-    org.springframework.kafka.listener: INFO
-    org.springframework.kafka.container: INFO
-
-    org.apache.kafka.clients.consumer: INFO
-    org.apache.kafka.clients.producer: INFO
-    org.apache.kafka.clients.consumer.internals: WARN
-    org.apache.kafka.clients.NetworkClient: WARN
-
-    kafka: INFO
-
-    # 23505 (unique key violation) é o mecanismo de idempotência — não é um erro real
+    org.apache.kafka: WARN
+    org.hibernate: WARN
+    # Duplicates are now handled via ON CONFLICT DO NOTHING — SqlExceptionHelper should never
+    # fire for expected 23505 violations. If it does, WARN is the right signal, not ERROR.
     org.hibernate.engine.jdbc.spi.SqlExceptionHelper: WARN

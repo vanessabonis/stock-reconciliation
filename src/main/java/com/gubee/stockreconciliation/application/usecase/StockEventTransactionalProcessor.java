@@ -54,10 +54,20 @@ public class StockEventTransactionalProcessor {
         this.objectMapper = objectMapper;
     }
 
-    // strategy
     // transação única no banco: tudo ou nada persiste
     @Transactional
     public EventStatus process(StockEvent event) {
+        // Idempotency guard: INSERT ON CONFLICT DO NOTHING — no exception on duplicate.
+        // Returns false (0 rows) if the eventId was already processed; skip all business logic.
+        // Concurrent duplicates are safe: exactly one caller gets true, the other(s) get false.
+
+        // O duplicate IGNORED sai em 6ms, ambos fast paths. O ON CONFLICT DO NOTHING (6ms) é
+        //  mais barato que uma transação abortada por lock (17ms), que é mais barata que um processamento completo.
+        // A hierarquia de custo tá correta.
+        boolean claimed = processedEventRepository.tryInsert(
+                event.eventId(), event.type(), event.accountId(), event.sku(), event.occurredAt());
+        if (!claimed) return EventStatus.IGNORED;
+
         return switch (event.type()) {
             case STOCK_ADJUSTED -> handleStockAdjusted(event);
             case ORDER_CREATED -> handleOrderCreated(event);
@@ -258,16 +268,10 @@ public class StockEventTransactionalProcessor {
         return EventStatus.INCONSISTENT;
     }
 
-    /**
-     * Grava o registro de evento processado. Se a constraint única em event_id disparar (duplicata),
-     * a DataIntegrityViolationException propaga para o chamador (process()), que a trata FORA desta
-     * transação — após o rollback — para evitar consultar uma transação PostgreSQL já abortada.
-     */
     private void saveProcessedEvent(StockEvent event, EventStatus status, String details) {
-        ProcessedEvent pe = new ProcessedEvent(
-                event.eventId(), event.type(), status,
-                event.accountId(), event.sku(), event.occurredAt(), details);
-        processedEventRepository.save(pe);
+        // Row was already claimed by the guard INSERT at the top of process().
+        // This UPDATE writes the final business outcome without risking a duplicate INSERT.
+        processedEventRepository.finalizeStatus(event.eventId(), status, details);
     }
 
     /**
