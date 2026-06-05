@@ -8,6 +8,8 @@ e gera uma trilha auditável completa das alterações realizadas.
 Inventory reconciliation service for marketplace integration. Receives stock and order events,
 maintains a reliable stock balance per account/SKU, and provides a full audit trail.
 
+See [DECISIONS.md](DECISIONS.md) for technical decisions, assumptions, and trade-offs.
+
 ## Technology Stack
 
 | Layer | Technology |
@@ -59,14 +61,27 @@ Tests use Testcontainers with a real PostgreSQL instance. Docker must be running
 
 ## Endpoints
 
+### Ingestion paths
+
+The service has **two ingestion paths** that both call the same `ProcessStockEventUseCase`:
+
+| Path | When to use |
+|------|-------------|
+| **Kafka** — topic `stock-events` | Primary path in production; guarantees ordering per `accountId:sku` partition key |
+| **`POST /events`** | Secondary path for local testing, Swagger UI, and administrative injection without a running Kafka producer |
+
+Both paths are functionally equivalent. The REST endpoint exists so you can exercise every scenario with plain `curl` without publishing to Kafka first.
+
+### Available endpoints
+
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/events` | Submit a stock or order event |
+| `POST` | `/events` | Submit a stock or order event (local testing / admin) |
 | `GET` | `/stocks/{accountId}/{sku}` | Current stock balance |
 | `GET` | `/stocks/{accountId}/{sku}/history` | Full audit history |
 | `GET` | `/events?status=PENDING` | Query events by status |
 
-Event statuses in response: `PROCESSED`, `IGNORED` (202), `PENDING` (202), `INCONSISTENT` (422).
+Event statuses in response: `PROCESSED`, `IGNORED` (200), `PENDING` (202), `INCONSISTENT` (422).
 
 ## Event Examples (curl)
 
